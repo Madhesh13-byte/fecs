@@ -1,30 +1,24 @@
 .alert-list {
-  padding: 1.5rem;
+  padding: 20px;
 }
 
 .alert-list h2 {
-  margin-bottom: 1.5rem;
-  color: #2d5016;
-  font-size: 1.3rem;
   display: flex;
   align-items: center;
-  gap: 0.5rem;
-  padding-bottom: 0.75rem;
-  border-bottom: 3px solid #c8e6c9;
+  gap: 10px;
+  margin-bottom: 20px;
+  color: #333;
 }
 
 .alert-list-icon {
-  font-size: 1.6rem;
-  color: #4a7c2c;
+  color: #1976d2;
+  font-size: 28px;
 }
 
 .no-alerts {
   text-align: center;
-  color: #558b2f;
-  margin-top: 3rem;
-  font-size: 1.1rem;
-  padding: 2rem;
-  background: #f1f8e9;
+  color: #666;
+  padding: 40px;
+  background: #f5f5f5;
   border-radius: 8px;
-  border: 2px dashed #c8e6c9;
 }

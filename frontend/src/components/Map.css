@@ -7,3 +7,18 @@
   background: transparent;
   border: none;
 }
+
+.custom-marker-label {
+  background: transparent;
+  border: none;
+}
+
+.custom-marker-label div {
+  cursor: pointer;
+  transition: transform 0.2s ease;
+}
+
+.custom-marker-label div:hover {
+  transform: scale(1.1);
+  box-shadow: 0 4px 12px rgba(0,0,0,0.4) !important;
+}

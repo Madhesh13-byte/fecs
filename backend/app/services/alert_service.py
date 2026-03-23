@@ -1,5 +1,5 @@
 from sqlalchemy.orm import Session
-from app.models import Alert, MessageType, SignalType, MonitoringStatus
+from app.models import Alert, MessageType, SignalType, MonitoringStatus, DeviceRegistration
 from app.schemas import IncomingAlert
 from datetime import datetime, timedelta
 from app.config import settings
@@ -18,6 +18,14 @@ def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
     c = 2 * math.atan2(math.sqrt(a), math.sqrt(1-a))
     
     return R * c
+
+def is_device_registered(db: Session, device_id: str) -> bool:
+    """Check if device is registered"""
+    registration = db.query(DeviceRegistration).filter(
+        DeviceRegistration.device_id == device_id,
+        DeviceRegistration.is_active == 1
+    ).first()
+    return registration is not None
 
 def is_duplicate(db: Session, alert: IncomingAlert) -> bool:
     """Check if alert is duplicate based on time and distance thresholds"""

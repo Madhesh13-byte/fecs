@@ -1,5 +1,5 @@
 import React, { useState, useEffect } from 'react';
-import { FaArrowLeft, FaUserPlus, FaEdit, FaToggleOn, FaToggleOff } from 'react-icons/fa';
+import { FaArrowLeft, FaUserPlus } from 'react-icons/fa';
 import axios from 'axios';
 
 function UserManagement({ onBack, onStatsUpdate }) {
@@ -65,7 +65,6 @@ function UserManagement({ onBack, onStatsUpdate }) {
         headers: { Authorization: `Bearer ${token}` }
       });
       
-      // Show success message with generated employee ID
       alert(`Operator created successfully!\nEmployee ID: ${response.data.employee_id}`);
       
       setShowCreateForm(false);
@@ -75,20 +74,6 @@ function UserManagement({ onBack, onStatsUpdate }) {
     } catch (error) {
       console.error('Error creating user:', error);
       alert('Failed to create user');
-    }
-  };
-
-  const toggleUserStatus = async (userId, currentStatus) => {
-    try {
-      const token = localStorage.getItem('token');
-      await axios.patch(
-        `http://localhost:8000/api/users/${userId}`,
-        { is_active: !currentStatus },
-        { headers: { Authorization: `Bearer ${token}` } }
-      );
-      fetchUsers();
-    } catch (error) {
-      console.error('Error updating user:', error);
     }
   };
 
@@ -190,11 +175,10 @@ function UserManagement({ onBack, onStatsUpdate }) {
                 <th>Role</th>
                 <th>Status</th>
                 <th>Created</th>
-                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
-              {users.map((user) => (
+              {users.filter(user => user.role !== 'admin').map((user) => (
                 <tr key={user.id}>
                   <td>{user.username}</td>
                   <td>{user.email}</td>
@@ -202,24 +186,11 @@ function UserManagement({ onBack, onStatsUpdate }) {
                   <td>{user.assigned_station || '-'}</td>
                   <td><span className={`role-badge ${user.role}`}>{user.role}</span></td>
                   <td>
-                    <span className={`status-badge ${user.is_active ? 'active' : 'inactive'}`}>
-                      {user.is_active ? 'Active' : 'Inactive'}
+                    <span className={`status-badge ${user.is_active === 1 ? 'active' : 'inactive'}`}>
+                      {user.is_active === 1 ? 'Active' : 'Inactive'}
                     </span>
                   </td>
                   <td>{new Date(user.created_at).toLocaleDateString()}</td>
-                  <td>
-                    {user.role !== 'admin' ? (
-                      <button
-                        className="action-btn"
-                        onClick={() => toggleUserStatus(user.id, user.is_active)}
-                        title={user.is_active ? 'Deactivate' : 'Activate'}
-                      >
-                        {user.is_active ? <FaToggleOn /> : <FaToggleOff />}
-                      </button>
-                    ) : (
-                      <span style={{ color: '#7cb342', fontSize: '0.9rem' }}>Always Active</span>
-                    )}
-                  </td>
                 </tr>
               ))}
             </tbody>

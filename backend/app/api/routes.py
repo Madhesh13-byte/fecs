@@ -5,7 +5,7 @@ from typing import List
 from app.database import get_db
 from app.models import Alert, User, UserRole, AlertStatus, DeviceRegistration, MessageType
 from app.schemas import (
-    AlertResponse, UserCreate, UserResponse, Token, AlertStatusUpdate, UserUpdate,
+    AlertResponse, UserCreate, UserResponse, Token, AlertStatusUpdate,
     DeviceRegistrationCreate, DeviceRegistrationResponse, UnmappedDevice
 )
 from app.services.auth_service import (
@@ -24,7 +24,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
             detail="Invalid authentication credentials"
         )
     user = db.query(User).filter(User.username == token_data.username).first()
-    if user is None or not user.is_active:
+    if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
     return user
 
@@ -55,8 +55,6 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session = 
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect employee ID or password"
         )
-    if not user.is_active:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User is inactive")
     
     access_token = create_access_token(data={"sub": user.username})
     return {"access_token": access_token, "token_type": "bearer"}
@@ -152,26 +150,6 @@ async def get_next_employee_id(
     
     return {"next_employee_id": next_id}
 
-@router.patch("/users/{user_id}")
-async def update_user(
-    user_id: int,
-    user_update: UserUpdate,
-    db: Session = Depends(get_db),
-    admin: User = Depends(get_admin_user)
-):
-    user = db.query(User).filter(User.id == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-    
-    # Prevent deactivating admin users
-    if user.role == UserRole.ADMIN:
-        raise HTTPException(status_code=403, detail="Cannot deactivate admin users")
-    
-    user.is_active = user_update.is_active
-    db.commit()
-    db.refresh(user)
-    return {"message": "User updated", "user": user}
-
 # Alert endpoints
 @router.get("/alerts", response_model=List[AlertResponse])
 async def get_alerts(
@@ -180,7 +158,127 @@ async def get_alerts(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    return db.query(Alert).order_by(Alert.received_at.desc()).offset(skip).limit(limit).all()
+    from sqlalchemy import outerjoin, func
+    
+    # For operators: Show only latest alert per registered device from their station
+    if current_user.role == UserRole.OPERATOR and current_user.assigned_station:
+        # Get all employee_ids from same station
+        station_operators = db.query(User.employee_id).filter(
+            User.assigned_station == current_user.assigned_station,
+            User.employee_id.isnot(None)
+        ).all()
+        station_emp_ids = [op[0] for op in station_operators]
+        
+        if not station_emp_ids:
+            return []
+        
+        # Get device_ids registered by operators from same station
+        station_device_ids = db.query(DeviceRegistration.device_id).filter(
+            DeviceRegistration.registered_by_emp_id.in_(station_emp_ids),
+            DeviceRegistration.is_active == 1
+        ).all()
+        station_device_ids = [d[0] for d in station_device_ids]
+        
+        if not station_device_ids:
+            return []
+        
+        # Get latest alert ID for each device
+        subquery = db.query(
+            Alert.device_id,
+            func.max(Alert.id).label('max_id')
+        ).filter(
+            Alert.device_id.in_(station_device_ids)
+        ).group_by(Alert.device_id).subquery()
+        
+        # Join to get full alert details with user info
+        results = db.query(
+            Alert,
+            DeviceRegistration.name,
+            DeviceRegistration.phone_number
+        ).join(
+            subquery,
+            (Alert.device_id == subquery.c.device_id) & (Alert.id == subquery.c.max_id)
+        ).outerjoin(
+            DeviceRegistration,
+            (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
+        ).order_by(Alert.received_at.desc()).all()
+    else:
+        # For admins: Show all alerts (existing behavior)
+        results = db.query(
+            Alert,
+            DeviceRegistration.name,
+            DeviceRegistration.phone_number
+        ).outerjoin(
+            DeviceRegistration,
+            (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
+        ).order_by(Alert.received_at.desc()).offset(skip).limit(limit).all()
+    
+    # Build response with user info
+    alerts = []
+    for alert, user_name, user_phone in results:
+        alert_dict = {
+            "id": alert.id,
+            "packet_id": alert.packet_id,
+            "device_id": alert.device_id,
+            "latitude": alert.latitude,
+            "longitude": alert.longitude,
+            "message_type": alert.message_type,
+            "signal_type": alert.signal_type,
+            "event_time": alert.event_time,
+            "received_at": alert.received_at,
+            "status": alert.status,
+            "source": alert.source,
+            "notes": alert.notes,
+            "user_name": user_name,
+            "user_phone": user_phone
+        }
+        alerts.append(alert_dict)
+    
+    return alerts
+
+@router.get("/alerts/device/{device_id}", response_model=List[AlertResponse])
+async def get_device_alert_history(
+    device_id: str,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Get all alert history for a specific device"""
+    from sqlalchemy import outerjoin
+    
+    # Get all alerts for this device with user info
+    results = db.query(
+        Alert,
+        DeviceRegistration.name,
+        DeviceRegistration.phone_number
+    ).outerjoin(
+        DeviceRegistration,
+        (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
+    ).filter(
+        Alert.device_id == device_id
+    ).order_by(Alert.received_at.desc()).all()
+    
+    # Build response
+    alerts = []
+    for alert, user_name, user_phone in results:
+        alert_dict = {
+            "id": alert.id,
+            "packet_id": alert.packet_id,
+            "device_id": alert.device_id,
+            "latitude": alert.latitude,
+            "longitude": alert.longitude,
+            "message_type": alert.message_type,
+            "signal_type": alert.signal_type,
+            "event_time": alert.event_time,
+            "received_at": alert.received_at,
+            "status": alert.status,
+            "source": alert.source,
+            "notes": alert.notes,
+            "user_name": user_name,
+            "user_phone": user_phone
+        }
+        alerts.append(alert_dict)
+    
+    return alerts
 
 @router.get("/alerts/{alert_id}", response_model=AlertResponse)
 async def get_alert(
@@ -188,10 +286,37 @@ async def get_alert(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
 ):
-    alert = db.query(Alert).filter(Alert.id == alert_id).first()
-    if not alert:
+    # Join with device_registrations to get user info
+    result = db.query(
+        Alert,
+        DeviceRegistration.name,
+        DeviceRegistration.phone_number
+    ).outerjoin(
+        DeviceRegistration,
+        (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
+    ).filter(Alert.id == alert_id).first()
+    
+    if not result:
         raise HTTPException(status_code=404, detail="Alert not found")
-    return alert
+    
+    alert, user_name, user_phone = result
+    
+    return {
+        "id": alert.id,
+        "packet_id": alert.packet_id,
+        "device_id": alert.device_id,
+        "latitude": alert.latitude,
+        "longitude": alert.longitude,
+        "message_type": alert.message_type,
+        "signal_type": alert.signal_type,
+        "event_time": alert.event_time,
+        "received_at": alert.received_at,
+        "status": alert.status,
+        "source": alert.source,
+        "notes": alert.notes,
+        "user_name": user_name,
+        "user_phone": user_phone
+    }
 
 @router.patch("/alerts/{alert_id}/status")
 async def update_alert_status(

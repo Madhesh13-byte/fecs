@@ -5,7 +5,7 @@ import logging
 from app.config import settings
 from app.schemas import IncomingAlert
 from app.database import SessionLocal
-from app.services.alert_service import is_duplicate, store_alert, should_send_ack
+from app.services.alert_service import is_duplicate, store_alert, is_device_registered
 from app.services.ack_service import publish_ack
 
 logger = logging.getLogger(__name__)
@@ -48,6 +48,17 @@ class MQTTHandler:
             
             db = SessionLocal()
             try:
+                # Security check: Only accept NORMAL alerts from unregistered devices
+                from app.services.alert_service import is_device_registered
+                is_registered = is_device_registered(db, alert.device_id)
+                
+                if not is_registered and alert.message_type != 'normal':
+                    logger.warning(
+                        f"Rejected {alert.message_type} alert from unregistered device: {alert.device_id}. "
+                        f"Only NORMAL alerts accepted from unregistered devices."
+                    )
+                    return
+                
                 # Check for duplicate
                 if is_duplicate(db, alert):
                     logger.info(f"Duplicate alert discarded: {alert.packet_id}")
@@ -57,9 +68,22 @@ class MQTTHandler:
                 stored_alert = store_alert(db, alert)
                 logger.info(f"Alert stored: {stored_alert.id}")
                 
-                # Send ACK if needed
-                if should_send_ack(alert) and self.client:
+                # Send automatic delivery ACK to base station for registered devices with manual signal type
+                if is_registered and alert.signal_type == 'manual' and self.client:
                     await publish_ack(alert, self.client)
+                    logger.info(f"Automatic delivery ACK sent for registered device: {alert.device_id}, signal: manual")
+                
+                # Get user info if device is registered
+                from app.models import DeviceRegistration
+                device_reg = db.query(DeviceRegistration).filter(
+                    DeviceRegistration.device_id == alert.device_id,
+                    DeviceRegistration.is_active == 1
+                ).first()
+                
+                user_name = device_reg.name if device_reg else None
+                user_phone = device_reg.phone_number if device_reg else None
+                
+
                 
                 # Push to WebSocket clients
                 if self.websocket_manager:
@@ -76,7 +100,9 @@ class MQTTHandler:
                             "event_time": stored_alert.event_time.isoformat(),
                             "received_at": stored_alert.received_at.isoformat(),
                             "status": stored_alert.status.value,
-                            "source": stored_alert.source
+                            "source": stored_alert.source,
+                            "user_name": user_name,
+                            "user_phone": user_phone
                         }
                     }))
                 

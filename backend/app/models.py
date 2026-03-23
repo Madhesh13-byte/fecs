@@ -49,7 +49,6 @@ class User(Base):
     employee_id = Column(String, unique=True, nullable=True)
     assigned_station = Column(String, nullable=True)
     created_at = Column(DateTime, server_default=func.now(), nullable=False)
-    is_active = Column(Integer, default=1, nullable=False)
 
 class DeviceRegistration(Base):
     __tablename__ = "device_registrations"

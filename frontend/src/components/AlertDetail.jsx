@@ -31,10 +31,23 @@ function AlertDetail({ alert, token, onUpdate }) {
   return (
     <div className={getAlertClass()}>
       <div className="alert-header">
-        <span className="device-id">{alert.device_id}</span>
+        <span className="device-id">
+          {alert.user_name ? (
+            <>
+              {alert.user_name}
+              <span style={{ fontSize: '11px', color: '#666', marginLeft: '8px' }}>({alert.device_id})</span>
+            </>
+          ) : (
+            <>
+              {alert.device_id}
+              <span style={{ fontSize: '11px', color: '#d32f2f', marginLeft: '8px' }}>⚠️ Unregistered</span>
+            </>
+          )}
+        </span>
         <span className={`status-badge ${alert.status}`}>{alert.status}</span>
       </div>
       <div className="alert-body">
+        {alert.user_phone && <p><strong>Phone:</strong> {alert.user_phone}</p>}
         <p><strong>Type:</strong> {alert.message_type}</p>
         <p><strong>Signal:</strong> {alert.signal_type}</p>
         <p><strong>Location:</strong> {alert.latitude.toFixed(6)}, {alert.longitude.toFixed(6)}</p>

@@ -47,6 +47,8 @@ class AlertResponse(BaseModel):
     status: AlertStatus
     source: str
     notes: Optional[str] = None
+    user_name: Optional[str] = None
+    user_phone: Optional[str] = None
     
     class Config:
         from_attributes = True
@@ -73,7 +75,6 @@ class UserResponse(BaseModel):
     employee_id: Optional[str]
     assigned_station: Optional[str]
     created_at: datetime
-    is_active: bool
     
     class Config:
         from_attributes = True
@@ -89,8 +90,7 @@ class AlertStatusUpdate(BaseModel):
     status: AlertStatus
     notes: Optional[str] = None
 
-class UserUpdate(BaseModel):
-    is_active: bool
+
 
 class DeviceRegistrationCreate(BaseModel):
     device_id: str

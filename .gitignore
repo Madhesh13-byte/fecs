@@ -40,8 +40,14 @@ htmlcov/
 
 # Environment variables
 .env
+.env.*
 .env.local
-.env.*.local
+.env.development
+.env.production
+.env.test
+*.env
+**/.env
+**/.env.*
 
 # Database
 *.db

@@ -3,7 +3,8 @@ import { FaTree, FaSignOutAlt, FaMapMarkedAlt, FaBell, FaMobileAlt, FaArrowLeft 
 import { FiMapPin, FiUser } from 'react-icons/fi';
 import axios from 'axios';
 import Map from './Map';
-import AlertList from './AlertList';
+import UserList from './UserList';
+import ReadOnlyAlertList from './ReadOnlyAlertList';
 import DeviceRegistration from './DeviceRegistration';
 import { getAlerts, getCurrentUser, getBaseStations } from '../services/api';
 import { connectWebSocket } from '../services/websocket';
@@ -118,8 +119,8 @@ const OperatorDashboard = ({ onLogout }) => {
           <div className="map-container">
             <Map alerts={alerts} baseStation={operatorStation} />
           </div>
-          <div className="alert-list-container">
-            <AlertList alerts={alerts} token={token} onUpdate={loadAlerts} />
+          <div className="user-list-container">
+            <UserList alerts={alerts} />
           </div>
         </div>
       </div>
@@ -154,7 +155,7 @@ const OperatorDashboard = ({ onLogout }) => {
           </div>
         </header>
         <div className="operator-content">
-          <AlertList alerts={alerts} token={token} onUpdate={loadAlerts} fullView={true} />
+          <ReadOnlyAlertList alerts={alerts} token={token} />
         </div>
       </div>
     );

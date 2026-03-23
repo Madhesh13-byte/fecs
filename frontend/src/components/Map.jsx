@@ -14,18 +14,53 @@ L.Icon.Default.mergeOptions({
 
 const getMarkerColor = (messageType) => {
   switch (messageType) {
-    case 'emergency': return 'red';
-    case 'high': return 'orange';
-    case 'normal': return 'green';
-    default: return 'blue';
+    case 'emergency': return '#d32f2f';
+    case 'high': return '#f57c00';
+    case 'normal': return '#388e3c';
+    default: return '#1976d2';
   }
 };
 
-const createColoredIcon = (color) => {
+const getUserInitials = (userName) => {
+  if (!userName) return '?';
+  const names = userName.trim().split(' ');
+  if (names.length === 1) {
+    return names[0].substring(0, 2).toUpperCase();
+  }
+  return (names[0][0] + names[names.length - 1][0]).toUpperCase();
+};
+
+const getDeviceNumber = (deviceId) => {
+  // Extract number from device ID (e.g., DEV_301 -> 301)
+  const match = deviceId.match(/\d+/);
+  return match ? match[0] : deviceId.substring(0, 3);
+};
+
+const createCustomMarker = (alert, color, isOutOfBounds) => {
+  const initials = getUserInitials(alert.user_name);
+  const deviceNum = getDeviceNumber(alert.device_id);
+  const label = `${initials}-${deviceNum}`;
+  const bgColor = isOutOfBounds ? '#ffeb3b' : color;
+  
   return L.divIcon({
-    className: 'custom-marker',
-    html: `<div style="background-color: ${color}; width: 25px; height: 25px; border-radius: 50%; border: 2px solid white;"></div>`,
-    iconSize: [25, 25],
+    className: 'custom-marker-label',
+    html: `
+      <div style="
+        background-color: ${bgColor};
+        color: white;
+        padding: 6px 10px;
+        border-radius: 8px;
+        font-weight: bold;
+        font-size: 12px;
+        border: 3px solid white;
+        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+        white-space: nowrap;
+        text-align: center;
+        font-family: Arial, sans-serif;
+      ">${label}</div>
+    `,
+    iconSize: [60, 30],
+    iconAnchor: [30, 15],
   });
 };
 
@@ -90,15 +125,28 @@ function Map({ alerts, baseStation }) {
           ? L.latLng(alert.latitude, alert.longitude).distanceTo(L.latLng(baseStation.latitude, baseStation.longitude)) > baseStation.radius_meters
           : false;
 
+        const markerColor = getMarkerColor(alert.message_type);
+
         return (
           <Marker
             key={alert.id}
             position={[alert.latitude, alert.longitude]}
-            icon={createColoredIcon(isOutOfBounds ? '#ffeb3b' : getMarkerColor(alert.message_type))}
+            icon={createCustomMarker(alert, markerColor, isOutOfBounds)}
           >
             <Popup>
               <div>
-                <strong>Device: {alert.device_id}</strong><br />
+                {alert.user_name ? (
+                  <>
+                    <strong>{alert.user_name}</strong><br />
+                    <span style={{ fontSize: '12px', color: '#666' }}>Device: {alert.device_id}</span><br />
+                    {alert.user_phone && <span style={{ fontSize: '12px' }}>Phone: {alert.user_phone}</span>}<br />
+                  </>
+                ) : (
+                  <>
+                    <strong>Device: {alert.device_id}</strong><br />
+                    <span style={{ fontSize: '12px', color: '#d32f2f' }}>⚠️ Unregistered Device</span><br />
+                  </>
+                )}
                 Type: {alert.message_type}<br />
                 Status: {alert.status}<br />
                 Time: {new Date(alert.event_time).toLocaleString()}
