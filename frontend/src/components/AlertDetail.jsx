@@ -20,10 +20,12 @@ function AlertDetail({ alert, token, onUpdate }) {
   };
 
   const getAlertClass = () => {
-    switch (alert.message_type) {
+    switch (alert.message_type?.toLowerCase()) {
       case 'emergency': return 'alert-card emergency';
       case 'high': return 'alert-card high';
       case 'normal': return 'alert-card normal';
+      case 'automated': return 'alert-card automated';
+      case 'cancel': return 'alert-card cancel';
       default: return 'alert-card';
     }
   };

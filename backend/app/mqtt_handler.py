@@ -4,9 +4,10 @@ import json
 import logging
 from app.config import settings
 from app.schemas import IncomingAlert
+from app.models import MessageType, AckType
 from app.database import SessionLocal
-from app.services.alert_service import is_duplicate, store_alert, is_device_registered
-from app.services.ack_service import publish_ack
+from app.services.alert_service import is_duplicate, store_alert, is_device_registered, check_automated_stationarity
+from app.services.ack_service import publish_ack, publish_buzzer_ack
 
 logger = logging.getLogger(__name__)
 
@@ -21,38 +22,38 @@ class MQTTHandler:
     async def process_incoming_alert(self, message: str):
         """Process incoming alert from MQTT"""
         try:
-            # Parse pipe-delimited format: packet_id|device_id|lat|lon|msg_type|sig_type|timestamp|source|checksum
+            # Parse pipe-delimited format: packet_id|device_id|lat|lon|msg_type|timestamp|checksum
+            # Hardware devices send location pings with message types
             parts = message.strip().split('|')
             
-            if len(parts) < 8:
+            if len(parts) < 6:
                 logger.error(f"Invalid message format: {message}")
                 return
             
-            # Map single-char codes to full values
-            msg_type_map = {'N': 'normal', 'H': 'high', 'E': 'emergency', 'C': 'cancel'}
-            sig_type_map = {'M': 'manual', 'A': 'auto'}
-            source_map = {'1': 'hardware', '0': 'software'}
+            msg_type_map = {'N': 'NORMAL', 'H': 'HIGH', 'E': 'EMERGENCY', 'C': 'CANCEL', 'A': 'AUTOMATED'}
             
             data = {
                 'packet_id': parts[0],
                 'device_id': parts[1],
                 'latitude': float(parts[2]),
                 'longitude': float(parts[3]),
-                'message_type': msg_type_map.get(parts[4], 'emergency'),
-                'signal_type': sig_type_map.get(parts[5], 'manual'),
-                'event_time': parts[6],  # Unix timestamp
-                'source': source_map.get(parts[7], 'hardware')
+                'message_type': msg_type_map.get(parts[4], 'normal'),
+                'event_time': parts[5],    # Unix timestamp
             }
             
             alert = IncomingAlert(**data)
-            
+            logger.info(
+                f"[INCOMING] packet_id={alert.packet_id} device={alert.device_id} "
+                f"type={alert.message_type.value} lat={alert.latitude} lon={alert.longitude}"
+            )
+
             db = SessionLocal()
             try:
                 # Security check: Only accept NORMAL alerts from unregistered devices
                 from app.services.alert_service import is_device_registered
                 is_registered = is_device_registered(db, alert.device_id)
                 
-                if not is_registered and alert.message_type != 'normal':
+                if not is_registered and alert.message_type != 'NORMAL':
                     logger.warning(
                         f"Rejected {alert.message_type} alert from unregistered device: {alert.device_id}. "
                         f"Only NORMAL alerts accepted from unregistered devices."
@@ -67,11 +68,31 @@ class MQTTHandler:
                 # Store alert
                 stored_alert = store_alert(db, alert)
                 logger.info(f"Alert stored: {stored_alert.id}")
-                
-                # Send automatic delivery ACK to base station for registered devices with manual signal type
-                if is_registered and alert.signal_type == 'manual' and self.client:
-                    await publish_ack(alert, self.client)
-                    logger.info(f"Automatic delivery ACK sent for registered device: {alert.device_id}, signal: manual")
+
+                # AUTOMATED stationarity check: two AUTOMATED alerts within 2h, moved < 10m → Buzzer ACK
+                ack_sent = AckType.NONE
+                if alert.message_type != MessageType.CANCEL and is_registered:
+                    buzzer_fired = False
+                    if alert.message_type == MessageType.AUTOMATED:
+                        if check_automated_stationarity(db, alert) and self.client:
+                            await publish_buzzer_ack(alert.device_id, self.client)
+                            buzzer_fired = True
+                            logger.info(
+                                f"Buzzer ACK sent: device {alert.device_id} stationary "
+                                f"(< 10m movement in last 2h)"
+                            )
+
+                    # LED ACK for all registered non-cancel types
+                    if self.client:
+                        await publish_ack(alert, self.client)
+                        logger.info(f"Automatic delivery ACK sent for registered device: {alert.device_id}")
+
+                    ack_sent = AckType.BUZZER_LED if buzzer_fired else AckType.LED
+
+                # Persist ack_sent to the alert row
+                stored_alert.ack_sent = ack_sent
+                db.commit()
+                db.refresh(stored_alert)
                 
                 # Get user info if device is registered
                 from app.models import DeviceRegistration
@@ -96,11 +117,9 @@ class MQTTHandler:
                             "latitude": stored_alert.latitude,
                             "longitude": stored_alert.longitude,
                             "message_type": stored_alert.message_type.value,
-                            "signal_type": stored_alert.signal_type.value,
                             "event_time": stored_alert.event_time.isoformat(),
                             "received_at": stored_alert.received_at.isoformat(),
                             "status": stored_alert.status.value,
-                            "source": stored_alert.source,
                             "user_name": user_name,
                             "user_phone": user_phone
                         }

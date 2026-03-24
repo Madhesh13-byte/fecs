@@ -15,11 +15,18 @@ export const login = async (username, password) => {
   return response.data;
 };
 
+// Normalize alert fields to lowercase so frontend components work consistently
+const normalizeAlert = (alert) => ({
+  ...alert,
+  message_type: alert.message_type ? alert.message_type.toLowerCase() : alert.message_type,
+  status: alert.status ? alert.status.toLowerCase() : alert.status,
+});
+
 export const getAlerts = async (token) => {
   const response = await axios.get(`${API_URL}/alerts`, {
     headers: { Authorization: `Bearer ${token}` }
   });
-  return response.data;
+  return response.data.map(normalizeAlert);
 };
 
 export const updateAlertStatus = async (alertId, status, notes, token) => {

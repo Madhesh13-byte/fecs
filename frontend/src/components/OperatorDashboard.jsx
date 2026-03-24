@@ -26,8 +26,8 @@ const OperatorDashboard = ({ onLogout }) => {
     fetchCurrentUser();
     loadAlerts();
     fetchStats();
-    const ws = connectWebSocket(token, handleNewAlert);
-    return () => ws.close();
+    const connection = connectWebSocket(token, handleNewAlert);
+    return () => connection.disconnect();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
@@ -260,10 +260,12 @@ const OperatorDashboard = ({ onLogout }) => {
             <div className="alert-preview-list">
               {alerts.slice(0, 5).map((alert) => (
                 <div key={alert.id} className="alert-preview-item" onClick={() => setView('map')}>
-                  <div className={`alert-type-badge ${alert.message_type}`}>
-                    {alert.message_type === 'emergency' && '🚨'}
-                    {alert.message_type === 'high' && '⚠️'}
-                    {alert.message_type === 'normal' && 'ℹ️'}
+                  <div className={`alert-type-badge ${alert.message_type?.toLowerCase()}`}>
+                    {alert.message_type?.toLowerCase() === 'emergency' && '🚨'}
+                    {alert.message_type?.toLowerCase() === 'high' && '⚠️'}
+                    {alert.message_type?.toLowerCase() === 'normal' && 'ℹ️'}
+                    {alert.message_type?.toLowerCase() === 'cancel' && '🔵'}
+                    {alert.message_type?.toLowerCase() === 'automated' && '🤖'}
                   </div>
                   <div className="alert-preview-info">
                     <strong>{alert.message_type.toUpperCase()}</strong>

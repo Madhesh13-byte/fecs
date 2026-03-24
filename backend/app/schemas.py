@@ -1,7 +1,7 @@
 from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from typing import Optional, Union
-from app.models import MessageType, SignalType, AlertStatus, UserRole
+from app.models import MessageType, AlertStatus, UserRole, AckType
 
 class IncomingAlert(BaseModel):
     packet_id: str
@@ -9,9 +9,7 @@ class IncomingAlert(BaseModel):
     latitude: float = Field(ge=-90, le=90)
     longitude: float = Field(ge=-180, le=180)
     message_type: MessageType
-    signal_type: SignalType
     event_time: Union[datetime, str, int]
-    source: str
     
     @field_validator('device_id')
     def device_id_not_empty(cls, v):
@@ -41,12 +39,11 @@ class AlertResponse(BaseModel):
     latitude: float
     longitude: float
     message_type: MessageType
-    signal_type: SignalType
     event_time: datetime
     received_at: datetime
     status: AlertStatus
-    source: str
     notes: Optional[str] = None
+    ack_sent: Optional[AckType] = None
     user_name: Optional[str] = None
     user_phone: Optional[str] = None
     
@@ -138,3 +135,9 @@ class BaseStationUpdate(BaseModel):
     longitude: Optional[float] = None
     radius_meters: Optional[float] = None
     is_active: Optional[bool] = None
+
+class ManualMessageCreate(BaseModel):
+    device_id: str
+    message_type: MessageType
+    latitude: float
+    longitude: float

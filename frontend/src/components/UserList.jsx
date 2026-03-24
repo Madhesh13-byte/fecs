@@ -4,11 +4,13 @@ import './UserList.css';
 
 function UserList({ alerts }) {
   const getAlertIcon = (messageType) => {
-    switch (messageType) {
+    switch (messageType?.toLowerCase()) {
       case 'emergency': return '🔴';
       case 'high': return '🟠';
       case 'normal': return '🟢';
-      default: return '🔵';
+      case 'cancel': return '🔵';
+      case 'automated': return '🤖';
+      default: return '⚪';
     }
   };
 
@@ -38,7 +40,7 @@ function UserList({ alerts }) {
       ) : (
         <div className="user-items">
           {alerts.map((alert) => (
-            <div key={alert.device_id} className={`user-item ${alert.message_type}`}>
+            <div key={alert.device_id} className={`user-item ${alert.message_type?.toLowerCase()}`}>
               <div className="user-item-header">
                 <span className="alert-icon">{getAlertIcon(alert.message_type)}</span>
                 <div className="user-info">
@@ -58,7 +60,7 @@ function UserList({ alerts }) {
               </div>
               <div className="user-item-body">
                 <div className="alert-info">
-                  <span className={`alert-type-badge ${alert.message_type}`}>
+                  <span className={`alert-type-badge ${alert.message_type?.toLowerCase()}`}>
                     {alert.message_type.toUpperCase()}
                   </span>
                   <span className={`status-badge ${alert.status}`}>

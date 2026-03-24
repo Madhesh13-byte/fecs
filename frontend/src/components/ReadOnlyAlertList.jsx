@@ -36,20 +36,24 @@ function ReadOnlyAlertList({ alerts, token }) {
   };
 
   const getAlertClass = (messageType) => {
-    switch (messageType) {
+    switch (messageType?.toLowerCase()) {
       case 'emergency': return 'readonly-alert-item emergency';
       case 'high': return 'readonly-alert-item high';
       case 'normal': return 'readonly-alert-item normal';
+      case 'automated': return 'readonly-alert-item automated';
+      case 'cancel': return 'readonly-alert-item cancel';
       default: return 'readonly-alert-item';
     }
   };
 
   const getAlertIcon = (messageType) => {
-    switch (messageType) {
+    switch (messageType?.toLowerCase()) {
       case 'emergency': return '🔴';
       case 'high': return '🟠';
       case 'normal': return '🟢';
-      default: return '🔵';
+      case 'cancel': return '🔵';
+      case 'automated': return '🤖';
+      default: return '⚪';
     }
   };
 
@@ -128,13 +132,13 @@ function ReadOnlyAlertList({ alerts, token }) {
                     ) : history.length > 0 ? (
                       <div className="history-timeline">
                         {history.map((histAlert, index) => (
-                          <div key={histAlert.id} className={`history-item ${histAlert.message_type}`}>
+                          <div key={histAlert.id} className={`history-item ${histAlert.message_type?.toLowerCase()}`}>
                             <div className="history-marker">
                               {index === 0 ? '📍' : '•'}
                             </div>
                             <div className="history-content">
                               <div className="history-title">
-                                <span className={`hist-type ${histAlert.message_type}`}>
+                                <span className={`hist-type ${histAlert.message_type?.toLowerCase()}`}>
                                   {histAlert.message_type.toUpperCase()}
                                 </span>
                                 <span className="hist-time">{formatTimeAgo(histAlert.received_at)}</span>

@@ -1,30 +1,54 @@
 const WS_URL = process.env.REACT_APP_WS_URL || 'ws://localhost:8000/ws';
 
-export const connectWebSocket = (token, onMessage) => {
-  const ws = new WebSocket(WS_URL);
+let reconnectTimeout = null;
 
-  ws.onopen = () => {
-    console.log('WebSocket connected');
+export const connectWebSocket = (token, onMessage) => {
+  let isIntentionallyClosed = false;
+  let ws = new WebSocket(WS_URL);
+  let reconnectTimeout = null;
+
+  const connect = () => {
+    ws = new WebSocket(WS_URL);
+
+    ws.onopen = () => {
+      console.log('WebSocket connected');
+    };
+
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data);
+        if (data.type === 'new_alert') {
+          const alert = data.data;
+          if (alert.message_type) alert.message_type = alert.message_type.toLowerCase();
+          if (alert.status) alert.status = alert.status.toLowerCase();
+          onMessage(alert);
+        }
+      } catch (error) {
+        console.error('WebSocket message error:', error);
+      }
+    };
+
+    ws.onerror = (error) => {
+      console.error('WebSocket error:', error);
+    };
+
+    ws.onclose = () => {
+      if (!isIntentionallyClosed) {
+        console.log('WebSocket disconnected. Reconnecting in 3s...');
+        reconnectTimeout = setTimeout(() => connect(), 3000);
+      } else {
+        console.log('WebSocket closed intentionally.');
+      }
+    };
   };
 
-  ws.onmessage = (event) => {
-    try {
-      const data = JSON.parse(event.data);
-      if (data.type === 'new_alert') {
-        onMessage(data.data);
-      }
-    } catch (error) {
-      console.error('WebSocket message error:', error);
+  connect();
+
+  return {
+    disconnect: () => {
+      isIntentionallyClosed = true;
+      if (reconnectTimeout) clearTimeout(reconnectTimeout);
+      if (ws) ws.close();
     }
   };
-
-  ws.onerror = (error) => {
-    console.error('WebSocket error:', error);
-  };
-
-  ws.onclose = () => {
-    console.log('WebSocket disconnected');
-  };
-
-  return ws;
 };

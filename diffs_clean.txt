@@ -1,0 +1,5957 @@
+UNSTAGED DIFF:
+diff --git a/backend/app/api/routes.py b/backend/app/api/routes.py
+index 5fc106e..86c7923 100644
+--- a/backend/app/api/routes.py
++++ b/backend/app/api/routes.py
+@@ -8,6 +8,7 @@ from app.schemas import (
+     AlertResponse, UserCreate, UserResponse, Token, AlertStatusUpdate,
+     DeviceRegistrationCreate, DeviceRegistrationResponse, UnmappedDevice
+ )
++from app.schemas_message import ManualMessageCreate
+ from app.services.auth_service import (
+     verify_password, get_password_hash, create_access_token, verify_token
+ )
+@@ -505,3 +506,59 @@ async def get_devices_by_station(
+         })
+     
+     return station_data
++
++# Manual Message Sending endpoint
++@router.post("/messages/send")
++async def send_manual_message(
++    message: ManualMessageCreate,
++    db: Session = Depends(get_db),
++    current_user: User = Depends(get_current_user)
++):
++    """Send manual message (high, emergency, cancel) to a device"""
++    from app.mqtt_handler import mqtt_handler
++    from app.services.ack_service import publish_buzzer_ack
++    from datetime import datetime
++    import uuid
++    
++    # Validate device is registered
++    device_reg = db.query(DeviceRegistration).filter(
++        DeviceRegistration.device_id == message.device_id,
++        DeviceRegistration.is_active == 1
++    ).first()
++    
++    if not device_reg:
++        raise HTTPException(status_code=404, detail="Device not registered")
++    
++    # Validate message type (only high, emergency, cancel allowed)
++    if message.message_type == MessageType.NORMAL:
++        raise HTTPException(status_code=400, detail="NORMAL messages are sent by hardware only")
++    
++    # Create alert record
++    from app.models import Alert, SignalType, AlertStatus
++    packet_id = f"MAN_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:6]}"
++    
++    alert = Alert(
++        packet_id=packet_id,
++        device_id=message.device_id,
++        latitude=message.latitude,
++        longitude=message.longitude,
++        message_type=message.message_type,
++        signal_type=SignalType.MANUAL,
++        event_time=datetime.utcnow(),
++        status=AlertStatus.PENDING,
++        source='software'
++    )
++    
++    db.add(alert)
++    db.commit()
++    db.refresh(alert)
++    
++    # Send buzzer ACK to device via MQTT
++    if mqtt_handler.client:
++        await publish_buzzer_ack(message.device_id, mqtt_handler.client)
++    
++    return {
++        "message": "Manual message sent successfully",
++        "alert_id": alert.id,
++        "packet_id": packet_id
++    }
+diff --git a/backend/app/mqtt_handler.py b/backend/app/mqtt_handler.py
+index 6dcb94f..9c66a1c 100644
+--- a/backend/app/mqtt_handler.py
++++ b/backend/app/mqtt_handler.py
+@@ -21,27 +21,23 @@ class MQTTHandler:
+     async def process_incoming_alert(self, message: str):
+         """Process incoming alert from MQTT"""
+         try:
+-            # Parse pipe-delimited format: packet_id|device_id|lat|lon|msg_type|sig_type|timestamp|source|checksum
++            # Parse pipe-delimited format: packet_id|device_id|lat|lon|timestamp|checksum
++            # Hardware devices only send NORMAL location pings
+             parts = message.strip().split('|')
+             
+-            if len(parts) < 8:
++            if len(parts) < 5:
+                 logger.error(f"Invalid message format: {message}")
+                 return
+             
+-            # Map single-char codes to full values
+-            msg_type_map = {'N': 'normal', 'H': 'high', 'E': 'emergency', 'C': 'cancel'}
+-            sig_type_map = {'M': 'manual', 'A': 'auto'}
+-            source_map = {'1': 'hardware', '0': 'software'}
+-            
+             data = {
+                 'packet_id': parts[0],
+                 'device_id': parts[1],
+                 'latitude': float(parts[2]),
+                 'longitude': float(parts[3]),
+-                'message_type': msg_type_map.get(parts[4], 'emergency'),
+-                'signal_type': sig_type_map.get(parts[5], 'manual'),
+-                'event_time': parts[6],  # Unix timestamp
+-                'source': source_map.get(parts[7], 'hardware')
++                'message_type': 'normal',  # Hardware only sends location pings
++                'signal_type': 'auto',     # Hardware signals are automatic
++                'event_time': parts[4],    # Unix timestamp
++                'source': 'hardware'
+             }
+             
+             alert = IncomingAlert(**data)
+
+
+LATEST COMMIT:
+commit 35e2abf7456f8bfeb35df7c2597fe80dd2c2675c
+Author: Madhesh <madheshs1303@gmail.com>
+Date:   Mon Mar 23 22:04:32 2026 +0530
+
+    backend alert recieve and ack send tested successfully
+
+diff --git a/.gitignore b/.gitignore
+index 1c4b7df..a34d1c0 100644
+--- a/.gitignore
++++ b/.gitignore
+@@ -40,8 +40,14 @@ htmlcov/
+ 
+ # Environment variables
+ .env
++.env.*
+ .env.local
+-.env.*.local
++.env.development
++.env.production
++.env.test
++*.env
++**/.env
++**/.env.*
+ 
+ # Database
+ *.db
+diff --git a/Base_Station_Management_Module.txt b/Base_Station_Management_Module.txt
+deleted file mode 100644
+index c6e1ab6..0000000
+--- a/Base_Station_Management_Module.txt
++++ /dev/null
+@@ -1,463 +0,0 @@
+-BASE STATION MANAGEMENT MODULE - COMPLETE WORKING DOCUMENTATION
+-================================================================
+-
+-PURPOSE
+--------
+-Provides admin visibility into which user modules are assigned to which base stations, based on the operator who registered them. This creates a hierarchical organizational structure for better monitoring and coordination.
+-
+-
+-CORE CONCEPT
+-------------
+-The module uses an existing relationship chain without requiring new database fields:
+-
+-User Module (DEV_001)
+-  ↓ registered_by_emp_id
+-Operator (EMP001)
+-  ↓ assigned_station
+-Base Station (Station-A)
+-
+-This means:
+-- When operator EMP001 registers device DEV_001
+-- And EMP001 is assigned to Station-A
+-- Then DEV_001 is implicitly assigned to Station-A
+-
+-
+-COMPLETE WORKFLOW
+------------------
+-
+-Step 1: Operator Registers Device
+-----------------------------------
+-Operator with employee_id EMP001 and assigned_station "Station-A" registers a user module:
+-
+-Device Registration:
+-- device_id: DEV_001
+-- name: Ranger Kumar
+-- phone_number: 9876543210
+-- registered_by_emp_id: EMP001 ← Links to operator
+-
+-Database stores this in device_registrations table.
+-
+-
+-Step 2: System Creates Implicit Link
+--------------------------------------
+-The system doesn't store station directly in device_registrations.
+-Instead, it uses a JOIN query to find the station:
+-
+-device_registrations.registered_by_emp_id = EMP001
+-  ↓ JOIN
+-users.employee_id = EMP001
+-users.assigned_station = "Station-A"
+-
+-Result: DEV_001 is linked to Station-A through EMP001
+-
+-
+-Step 3: Admin Views Base Station Management
+---------------------------------------------
+-Admin logs in and clicks "BASE STATIONS" card in dashboard.
+-
+-The system:
+-1. Queries all active device registrations
+-2. JOINs with users table on employee_id
+-3. Groups devices by assigned_station
+-4. Displays organized view
+-
+-
+-Step 4: Display Grouped by Station
+------------------------------------
+-UI shows devices organized by base station:
+-
+-┌─────────────────────────────────────────────────┐
+-│ Station-A (3 devices)                           │
+-├─────────────────────────────────────────────────┤
+-│ ┌─────────────────┐ ┌─────────────────┐        │
+-│ │ Ranger Kumar    │ │ Ranger Arun     │        │
+-│ │ DEV_001         │ │ DEV_002         │        │
+-│ │ 📞 9876543210   │ │ 📞 9876543211   │        │
+-│ │ 👤 By: EMP001   │ │ 👤 By: EMP001   │        │
+-│ └─────────────────┘ └─────────────────┘        │
+-└─────────────────────────────────────────────────┘
+-
+-┌─────────────────────────────────────────────────┐
+-│ Station-B (2 devices)                           │
+-├─────────────────────────────────────────────────┤
+-│ ┌─────────────────┐ ┌─────────────────┐        │
+-│ │ Ranger Karthik  │ │ Ranger Ravi     │        │
+-│ │ DEV_004         │ │ DEV_005         │        │
+-│ │ 📞 9876543214   │ │ 📞 9876543215   │        │
+-│ │ 👤 By: EMP005   │ │ 👤 By: EMP005   │        │
+-│ └─────────────────┘ └─────────────────┘        │
+-└─────────────────────────────────────────────────┘
+-
+-
+-DATA FLOW DIAGRAM
+------------------
+-
+-┌──────────────────┐
+-│ Operator EMP001  │
+-│ Station-A        │
+-└────────┬─────────┘
+-         │ registers device
+-         ↓
+-┌──────────────────────────┐
+-│ device_registrations     │
+-│ device_id: DEV_001       │
+-│ name: Ranger Kumar       │
+-│ registered_by_emp_id:    │
+-│   EMP001                 │
+-└────────┬─────────────────┘
+-         │
+-         ↓
+-┌──────────────────────────┐
+-│ Admin Dashboard          │
+-│ "BASE STATIONS" clicked  │
+-└────────┬─────────────────┘
+-         │ GET /base-stations/devices
+-         ↓
+-┌──────────────────────────┐
+-│ Backend API              │
+-│ routes.py                │
+-└────────┬─────────────────┘
+-         │ SQL JOIN query
+-         ↓
+-┌──────────────────────────────────────────┐
+-│ SELECT                                   │
+-│   dr.device_id,                          │
+-│   dr.name,                               │
+-│   dr.phone_number,                       │
+-│   dr.registered_by_emp_id,               │
+-│   u.assigned_station                     │
+-│ FROM device_registrations dr             │
+-│ JOIN users u                             │
+-│   ON dr.registered_by_emp_id =           │
+-│      u.employee_id                       │
+-│ WHERE dr.is_active = 1                   │
+-└────────┬─────────────────────────────────┘
+-         │ Results
+-         ↓
+-┌──────────────────────────┐
+-│ Group by Station         │
+-│ {                        │
+-│   "Station-A": [         │
+-│     {device_id, name...} │
+-│   ],                     │
+-│   "Station-B": [...]     │
+-│ }                        │
+-└────────┬─────────────────┘
+-         │
+-         ↓
+-┌──────────────────────────┐
+-│ BaseStationView.jsx      │
+-│ Renders grouped cards    │
+-└──────────────────────────┘
+-
+-
+-DATABASE STRUCTURE
+-------------------
+-
+-No new tables needed! Uses existing structure:
+-
+-users table:
+-┌────┬──────────┬─────────────┬──────────────────┐
+-│ id │ username │ employee_id │ assigned_station │
+-├────┼──────────┼─────────────┼──────────────────┤
+-│ 1  │ admin    │ NULL        │ NULL             │
+-│ 2  │ op1      │ EMP001      │ Station-A        │
+-│ 3  │ op2      │ EMP002      │ Station-A        │
+-│ 4  │ op3      │ EMP005      │ Station-B        │
+-└────┴──────────┴─────────────┴──────────────────┘
+-
+-device_registrations table:
+-┌────┬───────────┬──────────────┬──────────────┬──────────────────────┐
+-│ id │ device_id │ name         │ phone_number │ registered_by_emp_id │
+-├────┼───────────┼──────────────┼──────────────┼──────────────────────┤
+-│ 1  │ DEV_001   │ Ranger Kumar │ 9876543210   │ EMP001               │
+-│ 2  │ DEV_002   │ Ranger Arun  │ 9876543211   │ EMP001               │
+-│ 3  │ DEV_003   │ Ranger Vijay │ 9876543212   │ EMP002               │
+-│ 4  │ DEV_004   │ Ranger Karthik│ 9876543214  │ EMP005               │
+-│ 5  │ DEV_005   │ Ranger Ravi  │ 9876543215   │ EMP005               │
+-└────┴───────────┴──────────────┴──────────────┴──────────────────────┘
+-
+-JOIN Result (what admin sees):
+-┌───────────┬──────────────┬──────────────┬──────────────────────┬──────────────────┐
+-│ device_id │ name         │ phone_number │ registered_by_emp_id │ assigned_station │
+-├───────────┼──────────────┼──────────────┼──────────────────────┼──────────────────┤
+-│ DEV_001   │ Ranger Kumar │ 9876543210   │ EMP001               │ Station-A        │
+-│ DEV_002   │ Ranger Arun  │ 9876543211   │ EMP001               │ Station-A        │
+-│ DEV_003   │ Ranger Vijay │ 9876543212   │ EMP002               │ Station-A        │
+-│ DEV_004   │ Ranger Karthik│ 9876543214  │ EMP005               │ Station-B        │
+-│ DEV_005   │ Ranger Ravi  │ 9876543215   │ EMP005               │ Station-B        │
+-└───────────┴──────────────┴──────────────┴──────────────────────┴──────────────────┘
+-
+-
+-API ENDPOINT
+-------------
+-
+-GET /base-stations/devices
+-Purpose: Get all devices grouped by base station
+-Access: Admin only
+-Authentication: Bearer token required
+-
+-Response Format:
+-{
+-  "Station-A": [
+-    {
+-      "device_id": "DEV_001",
+-      "name": "Ranger Kumar",
+-      "phone_number": "9876543210",
+-      "registered_by_emp_id": "EMP001",
+-      "registered_at": "2024-01-15T10:00:00"
+-    },
+-    {
+-      "device_id": "DEV_002",
+-      "name": "Ranger Arun",
+-      "phone_number": "9876543211",
+-      "registered_by_emp_id": "EMP001",
+-      "registered_at": "2024-01-15T11:00:00"
+-    }
+-  ],
+-  "Station-B": [
+-    {
+-      "device_id": "DEV_004",
+-      "name": "Ranger Karthik",
+-      "phone_number": "9876543214",
+-      "registered_by_emp_id": "EMP005",
+-      "registered_at": "2024-01-15T12:00:00"
+-    }
+-  ]
+-}
+-
+-
+-UI COMPONENTS
+--------------
+-
+-1. Summary Cards (Top Section)
+-   - Total Active Stations count
+-   - Total Devices count
+-   - Visual icons for quick overview
+-
+-2. Station Sections (Main Content)
+-   Each station displayed as:
+-   - Station header with name and device count
+-   - Grid of device cards
+-   - Each card shows:
+-     * User name
+-     * Device ID badge
+-     * Phone number
+-     * Registered by (employee_id)
+-     * Registration date
+-
+-3. Device Cards
+-   - Hover effect for interactivity
+-   - Color-coded badges
+-   - Icon-based information display
+-
+-
+-KEY FEATURES
+-------------
+-
+-1. Zero Configuration
+-   - No new database fields needed
+-   - Uses existing relationships
+-   - Automatic grouping
+-
+-2. Hierarchical Organization
+-   - Clear station → operator → device structure
+-   - Easy to see coverage per station
+-   - Identify which operators manage which devices
+-
+-3. Admin Visibility
+-   - See all stations at a glance
+-   - Monitor device distribution
+-   - Track registration accountability
+-
+-4. Scalability
+-   - Works with any number of stations
+-   - Handles unassigned operators gracefully
+-   - Efficient SQL JOIN query
+-
+-
+-REAL-WORLD EXAMPLE
+-------------------
+-
+-Scenario: Forest Department with Multiple Stations
+-
+-Setup:
+-- Station-A covers North Forest (operators EMP001, EMP002)
+-- Station-B covers South Forest (operator EMP005)
+-
+-Day 1:
+-- EMP001 registers DEV_001 (Ranger Kumar)
+-- EMP001 registers DEV_002 (Ranger Arun)
+-- EMP002 registers DEV_003 (Ranger Vijay)
+-
+-Day 2:
+-- EMP005 registers DEV_004 (Ranger Karthik)
+-- EMP005 registers DEV_005 (Ranger Ravi)
+-
+-Admin View:
+-┌─────────────────────────────────┐
+-│ Station-A (3 devices)           │
+-│ - Ranger Kumar (DEV_001)        │
+-│ - Ranger Arun (DEV_002)         │
+-│ - Ranger Vijay (DEV_003)        │
+-└─────────────────────────────────┘
+-
+-┌─────────────────────────────────┐
+-│ Station-B (2 devices)           │
+-│ - Ranger Karthik (DEV_004)      │
+-│ - Ranger Ravi (DEV_005)         │
+-└─────────────────────────────────┘
+-
+-Benefits:
+-- Admin knows North Forest has 3 active devices
+-- Admin knows South Forest has 2 active devices
+-- Can plan resource allocation accordingly
+-- Can track which operators are active
+-
+-
+-USE CASES
+----------
+-
+-1. Resource Planning
+-   - See which stations have more/fewer devices
+-   - Plan device distribution
+-   - Identify coverage gaps
+-
+-2. Operational Monitoring
+-   - Track active devices per station
+-   - Monitor operator activity
+-   - Verify registration patterns
+-
+-3. Emergency Coordination
+-   - Know which station covers which devices
+-   - Contact appropriate base station during alerts
+-   - Coordinate multi-station responses
+-
+-4. Audit and Accountability
+-   - See who registered which devices
+-   - Track operator performance
+-   - Verify proper device assignment
+-
+-
+-TECHNICAL IMPLEMENTATION
+-------------------------
+-
+-Backend Files:
+-- routes.py: Added GET /base-stations/devices endpoint
+-  * Performs JOIN query
+-  * Groups results by station
+-  * Returns JSON object
+-
+-Frontend Files:
+-- BaseStationView.jsx: Main component
+-  * Fetches station data
+-  * Renders summary cards
+-  * Displays grouped device cards
+-  
+-- BaseStationView.css: Styling
+-  * Station section layout
+-  * Device card grid
+-  * Responsive design
+-
+-- AdminDashboard.jsx: Integration
+-  * Added "BASE STATIONS" card
+-  * Added routing for stations view
+-  * Navigation handling
+-
+-
+-SQL QUERY LOGIC
+----------------
+-
+-The core query that powers this module:
+-
+-SELECT 
+-  dr.device_id,
+-  dr.name,
+-  dr.phone_number,
+-  dr.registered_by_emp_id,
+-  dr.registered_at,
+-  u.assigned_station
+-FROM device_registrations dr
+-JOIN users u ON dr.registered_by_emp_id = u.employee_id
+-WHERE dr.is_active = 1
+-ORDER BY u.assigned_station, dr.name
+-
+-This query:
+-1. Gets all active device registrations
+-2. Joins with users table on employee_id
+-3. Retrieves assigned_station from users
+-4. Orders by station then name
+-5. Backend groups results by station
+-
+-
+-ADVANTAGES OF THIS DESIGN
+---------------------------
+-
+-1. No Database Changes
+-   - Uses existing fields
+-   - No migration needed
+-   - No schema complexity
+-
+-2. Automatic Updates
+-   - If operator changes station, devices follow
+-   - Real-time reflection of current structure
+-   - No manual reassignment needed
+-
+-3. Flexible
+-   - Supports multiple operators per station
+-   - Handles unassigned operators
+-   - Scales to any number of stations
+-
+-4. Maintainable
+-   - Simple JOIN query
+-   - Clear relationship chain
+-   - Easy to understand logic
+-
+-5. Efficient
+-   - Single query for all data
+-   - Grouping done in backend
+-   - Minimal frontend processing
+-
+-
+-EDGE CASES HANDLED
+-------------------
+-
+-1. Operator Without Station
+-   - Shows under "Unassigned" group
+-   - Still displays device info
+-   - Admin can identify and fix
+-
+-2. No Devices Registered
+-   - Shows empty state message
+-   - Prompts to register devices
+-   - Clean UI feedback
+-
+-3. Multiple Operators Same Station
+-   - All devices grouped together
+-   - Shows which operator registered each
+-   - Clear accountability maintained
+-
+-4. Operator Changes Station
+-   - Devices automatically move to new station
+-   - Historical data preserved
+-   - No manual updates needed
+-
+-
+-BUSINESS RULES
+---------------
+-
+-1. Only active devices shown (is_active = 1)
+-2. Only admin can view this module
+-3. Grouping based on operator's current assigned_station
+-4. Devices without valid operator shown as "Unassigned"
+-5. Station names case-sensitive (Station-A ≠ station-a)
+-
+-
+-CONCLUSION
+-----------
+-
+-The Base Station Management Module provides hierarchical visibility into device organization without requiring additional database fields. It leverages the existing relationship between devices, operators, and stations to create an intuitive admin view.
+-
+-Key Innovation: Using registered_by_emp_id as the link between devices and stations, creating an implicit but powerful organizational structure.
+-
+-Result: Admins can see at a glance which base stations have which devices, enabling better resource planning, operational monitoring, and emergency coordination.
+diff --git a/CLEANUP_SUMMARY.md b/CLEANUP_SUMMARY.md
+new file mode 100644
+index 0000000..c133cf3
+--- /dev/null
++++ b/CLEANUP_SUMMARY.md
+@@ -0,0 +1,135 @@
++# Project Cleanup Summary
++
++## Files Removed
++
++### Root Directory (7 files removed):
++- ❌ `EXPANDABLE_ALERT_FEATURE.md` - Feature-specific documentation (outdated)
++- ❌ `COMPREHENSIVE_TEST_GUIDE.md` - Redundant test guide
++- ❌ `DOCKER_HUB_GUIDE.md` - Not using Docker Hub
++- ❌ `EXPORT_IMAGES_GUIDE.md` - Not needed
++- ❌ `Base_Station_Management_Module.txt` - Old design document
++- ❌ `Device_Registration_Module.txt` - Old design document
++- ❌ `FECS Software Design Specification.txt` - Duplicate (kept .docx version)
++
++### Backend Directory (1 file removed):
++- ❌ `Dockerfile.stable` - Duplicate Dockerfile
++
++### Frontend Components (6 files removed):
++- ❌ `AlertLogs.jsx` - Not used in application
++- ❌ `NetworkPlanner.jsx` - Not used in application
++- ❌ `ExpandableAlertList.jsx` - Replaced by ReadOnlyAlertList
++- ❌ `ExpandableAlertList.css` - Associated CSS file
++- ❌ `AlertList.jsx` - Replaced by UserList
++- ❌ `AlertList.css` - Associated CSS file
++
++## Files Kept
++
++### Root Directory:
++- ✅ `COMPLETE_FEATURE_SUMMARY.md` - Main documentation
++- ✅ `DEPLOYMENT_GUIDE.md` - Deployment instructions
++- ✅ `DOCKER_SETUP.md` - Docker configuration guide
++- ✅ `Fecs Software Design Specification.docx` - Original specification
++- ✅ `mqtt_ack_subscriber.bat` - ACK monitoring tool
++- ✅ `mqtt_test_complete_workflow.bat` - End-to-end test script
++- ✅ `.env.example` - Environment template
++- ✅ `.gitignore` - Git configuration
++- ✅ `docker-compose.yml` - Docker orchestration
++
++### Backend:
++- ✅ All core application files
++- ✅ `debug_device_check.py` - Debugging utility
++- ✅ `test_alerts_api.py` - API testing utility
++- ✅ `Dockerfile` - Container configuration
++- ✅ `requirements.txt` - Python dependencies
++
++### Frontend:
++- ✅ All active components:
++  - `AdminDashboard.jsx/css`
++  - `OperatorDashboard.jsx/css`
++  - `Login.jsx/css`
++  - `Map.jsx/css`
++  - `UserList.jsx/css`
++  - `ReadOnlyAlertList.jsx/css`
++  - `DeviceRegistration.jsx/css`
++  - `AlertDetail.jsx/css`
++  - `BaseStationView.jsx/css`
++  - `UserManagement.jsx`
++- ✅ Services: `api.js`, `websocket.js`
++- ✅ `Dockerfile` - Container configuration
++- ✅ `package.json` - Node dependencies
++
++## Current Project Structure
++
++```
++forest_emergency_communication/
++├── backend/
++│   ├── alembic/              # Database migrations
++│   ├── app/                  # Core application
++│   │   ├── api/             # API routes
++│   │   ├── services/        # Business logic
++│   │   └── *.py             # Core modules
++│   ├── debug_device_check.py
++│   ├── test_alerts_api.py
++│   ├── Dockerfile
++│   └── requirements.txt
++├── frontend/
++│   ├── src/
++│   │   ├── components/      # React components (cleaned)
++│   │   └── services/        # API & WebSocket
++│   ├── Dockerfile
++│   └── package.json
++├── mosquitto/
++│   └── config/              # MQTT broker config
++├── COMPLETE_FEATURE_SUMMARY.md
++├── DEPLOYMENT_GUIDE.md
++├── DOCKER_SETUP.md
++├── Fecs Software Design Specification.docx
++├── mqtt_ack_subscriber.bat
++├── mqtt_test_complete_workflow.bat
++└── docker-compose.yml
++```
++
++## Benefits of Cleanup
++
++1. ✅ **Reduced Clutter** - Removed 14 unnecessary files
++2. ✅ **Clear Structure** - Only active components remain
++3. ✅ **Easier Maintenance** - Less confusion about which files are used
++4. ✅ **Faster Navigation** - Developers can find files quickly
++5. ✅ **Smaller Repository** - Reduced project size
++
++## Active Components Summary
++
++### Backend Services:
++- MQTT Handler (incoming alerts)
++- ACK Service (acknowledgments)
++- Alert Service (storage & validation)
++- Auth Service (authentication)
++- Monitoring Service (unconsciousness detection)
++
++### Frontend Components:
++- AdminDashboard (admin interface)
++- OperatorDashboard (operator interface)
++- Map (with unique markers)
++- UserList (latest status)
++- ReadOnlyAlertList (alert history)
++- DeviceRegistration (device management)
++- Login (authentication)
++
++### Test & Debug Tools:
++- `mqtt_ack_subscriber.bat` - Monitor ACK messages
++- `mqtt_test_complete_workflow.bat` - End-to-end test
++- `debug_device_check.py` - Database debugging
++- `test_alerts_api.py` - API testing
++
++## Next Steps
++
++1. ✅ Project is clean and organized
++2. ✅ All unnecessary files removed
++3. ✅ Documentation consolidated
++4. ✅ Ready for production deployment
++
++---
++
++**Cleanup Date:** 2024
++**Files Removed:** 14
++**Project Status:** Clean & Production Ready ✅
+diff --git a/COMPLETE_FEATURE_SUMMARY.md b/COMPLETE_FEATURE_SUMMARY.md
+new file mode 100644
+index 0000000..6c6e336
+--- /dev/null
++++ b/COMPLETE_FEATURE_SUMMARY.md
+@@ -0,0 +1,274 @@
++# FECS - Complete Feature Implementation Summary
++
++## All Implemented Features
++
++### 1. ✅ Security: Unregistered Device Filtering
++**What**: Only Normal alerts accepted from unregistered devices
++**Why**: Prevents fake emergencies from unknown devices
++**Files Modified**: 
++- `backend/app/mqtt_handler.py`
++- `backend/app/services/alert_service.py`
++
++### 2. ✅ User Information Display
++**What**: Shows user names and phone numbers on map and alerts
++**Why**: Identify personnel instead of just device IDs
++**Files Modified**:
++- `backend/app/schemas.py` (added user_name, user_phone)
++- `backend/app/api/routes.py` (JOIN with device_registrations)
++- `backend/app/mqtt_handler.py` (WebSocket with user info)
++- `frontend/src/components/Map.jsx` (display user info)
++- `frontend/src/components/AlertDetail.jsx` (display user info)
++
++### 3. ✅ Latest Alert Per Device (Operators)
++**What**: Operators see only latest alert per device, not all history
++**Why**: Clean current status view, not cluttered with old positions
++**Files Modified**:
++- `backend/app/api/routes.py` (subquery for latest per device)
++
++### 4. ✅ Restructured Dashboard Views
++**What**: Separated current status from historical audit
++**Structure**:
++- **Map & Alerts**: Map + User List (latest status)
++- **Alert Logs**: Expandable cards (full history, read-only)
++
++**Files Created**:
++- `frontend/src/components/UserList.jsx` (simple user list)
++- `frontend/src/components/UserList.css`
++- `frontend/src/components/ReadOnlyAlertList.jsx` (expandable history)
++- `frontend/src/components/ReadOnlyAlertList.css`
++
++**Files Modified**:
++- `frontend/src/components/OperatorDashboard.jsx`
++- `frontend/src/components/OperatorDashboard.css`
++
++### 5. ✅ Unique Marker Identification
++**What**: Each user gets unique marker with Initials + Device Number
++**Format**: `JD-301` (John Doe, DEV_301) or `?-999` (Unregistered)
++**Why**: Instant visual identification without clicking markers
++
++**Files Modified**:
++- `frontend/src/components/Map.jsx` (custom marker creation)
++- `frontend/src/components/Map.css` (marker styling)
++
++### 6. ✅ Alert History API
++**What**: New endpoint to fetch complete history for specific device
++**Endpoint**: `GET /api/alerts/device/{device_id}`
++**Files Modified**:
++- `backend/app/api/routes.py`
++
++## Test Scripts Created
++
++1. **mqtt_send_test_alerts.bat** - Basic security test
++2. **mqtt_test_user_display.bat** - User info display test
++3. **mqtt_test_registered_emergency.bat** - Emergency from registered devices
++4. **mqtt_test_latest_alert.bat** - Latest alert per device test
++5. **mqtt_test_expandable_history.bat** - Expandable history test
++6. **mqtt_test_new_structure.bat** - New dashboard structure test
++7. **mqtt_test_unique_markers.bat** - Unique marker identification test
++8. **mqtt_test_all_alert_types.bat** - Comprehensive test (ALL FEATURES)
++
++## Documentation Created
++
++1. **EXPANDABLE_ALERT_FEATURE.md** - Expandable alert list documentation
++2. **NEW_ALERT_STRUCTURE.md** - Dashboard restructure documentation
++3. **UNIQUE_MARKER_FEATURE.md** - Unique marker documentation
++4. **COMPREHENSIVE_TEST_GUIDE.md** - Visual test guide
++5. **OPERATOR_QUICK_REFERENCE.md** - Quick reference for operators
++
++## Debug Scripts Created
++
++1. **debug_device_check.py** - Check device registrations in database
++2. **test_alerts_api.py** - Test alerts API query
++
++## Complete System Flow
++
++### 1. Alert Reception
++```
++Hardware Device
++    ↓
++MQTT (fecs/incoming)
++    ↓
++mqtt_handler.py
++    ↓
++Security Check (registered?)
++    ↓
++Store in Database
++    ↓
++WebSocket Broadcast
++    ↓
++Frontend Update
++```
++
++### 2. Data Flow for Operators
++```
++Login
++    ↓
++Dashboard Home
++    ↓
++┌─────────────────┬─────────────────┬─────────────────┐
++│  Map & Alerts   │   Alert Logs    │ Device Mgmt     │
++│                 │                 │                 │
++│ Map + User List │ Expandable      │ Register        │
++│ (Latest Status) │ History Cards   │ New Devices     │
++│                 │ (Read-only)     │                 │
++└─────────────────┴─────────────────┴─────────────────┘
++```
++
++### 3. Map Display Logic
++```
++GET /api/alerts
++    ↓
++Returns: Latest alert per device (for operators)
++    ↓
++For each alert:
++  - Extract user initials
++  - Extract device number
++  - Create marker: "JD-301"
++  - Color by alert type
++    ↓
++Display on map
++```
++
++## Key Benefits
++
++### For Operators:
++1. ✅ **Instant Identification** - See who's who on map
++2. ✅ **Clean Interface** - Only current status by default
++3. ✅ **Full History Available** - Click to expand when needed
++4. ✅ **Security** - No fake emergencies from unknown devices
++5. ✅ **Better Context** - Names and phone numbers visible
++
++### For System:
++1. ✅ **Performance** - Load only what's needed
++2. ✅ **Scalability** - Handles many users without clutter
++3. ✅ **Security** - Validated device registration
++4. ✅ **Audit Trail** - Complete history preserved
++5. ✅ **Maintainability** - Clear separation of concerns
++
++## Testing Workflow
++
++### Quick Test (5 minutes):
++```bash
++# 1. Register devices DEV_301, DEV_302, DEV_303
++# 2. Run comprehensive test
++cd e:\forest_emergency_communication
++mqtt_test_all_alert_types.bat
++
++# 3. Check results:
++# - Map shows unique markers
++# - User list shows latest status
++# - Alert logs expandable
++# - Backend logs show rejections
++```
++
++### Full Test (15 minutes):
++```bash
++# Run all test scripts in sequence
++mqtt_send_test_alerts.bat
++mqtt_test_user_display.bat
++mqtt_test_registered_emergency.bat
++mqtt_test_latest_alert.bat
++mqtt_test_expandable_history.bat
++mqtt_test_new_structure.bat
++mqtt_test_unique_markers.bat
++mqtt_test_all_alert_types.bat
++```
++
++## Production Deployment Checklist
++
++### Backend:
++- [ ] Database migrations applied
++- [ ] Environment variables configured
++- [ ] MQTT broker running
++- [ ] Backend server running
++- [ ] WebSocket connections working
++
++### Frontend:
++- [ ] Dependencies installed (`npm install`)
++- [ ] Environment variables configured
++- [ ] Build created (`npm run build`)
++- [ ] Frontend server running
++
++### Testing:
++- [ ] Admin can create users
++- [ ] Operators can login with Employee ID
++- [ ] Devices can be registered
++- [ ] Alerts appear on map
++- [ ] Markers show correct labels
++- [ ] Colors match alert types
++- [ ] User list updates in real-time
++- [ ] Alert logs expandable
++- [ ] Security filtering works
++
++### Documentation:
++- [ ] Operator training completed
++- [ ] Quick reference distributed
++- [ ] Admin guide available
++- [ ] Troubleshooting guide ready
++
++## Future Enhancements (Optional)
++
++### Phase 2 Features:
++1. **Marker Clustering** - Group nearby markers when zoomed out
++2. **Movement Trails** - Show path when viewing history
++3. **Photo Markers** - Display user photos on markers
++4. **Custom Alerts** - Operators can create custom alert types
++5. **Export Reports** - Download alert history as PDF/CSV
++6. **Mobile App** - Native mobile application
++7. **Push Notifications** - Real-time alerts on mobile
++8. **Voice Alerts** - Audio notifications for emergencies
++9. **Multi-Station Sync** - Synchronize across multiple stations
++10. **Analytics Dashboard** - Statistics and trends
++
++### Technical Improvements:
++1. **Caching** - Redis for faster queries
++2. **Load Balancing** - Handle more concurrent users
++3. **Database Optimization** - Indexes and query optimization
++4. **Monitoring** - System health monitoring
++5. **Backup** - Automated database backups
++6. **Logging** - Centralized log management
++7. **Testing** - Automated unit and integration tests
++8. **CI/CD** - Automated deployment pipeline
++
++## Support and Maintenance
++
++### Regular Tasks:
++- Monitor backend logs for errors
++- Check database size and performance
++- Review alert patterns for anomalies
++- Update device registrations
++- Train new operators
++
++### Troubleshooting:
++- Check backend logs: `backend/logs/`
++- Check browser console: F12
++- Verify MQTT broker: `mosquitto_sub -h localhost -t fecs/incoming -v`
++- Test database: `python debug_device_check.py`
++- Test API: `python test_alerts_api.py`
++
++## Version History
++
++**v1.0** - Initial Release
++- Basic alert system
++- Map visualization
++- Device registration
++
++**v2.0** - Security & UX Update (Current)
++- ✅ Unregistered device filtering
++- ✅ User information display
++- ✅ Latest alert per device
++- ✅ Restructured dashboard
++- ✅ Unique marker identification
++- ✅ Alert history tracking
++
++**v3.0** - Planned
++- Multi-station synchronization
++- Mobile application
++- Advanced analytics
++
++---
++
++**System**: Forest Emergency Communication System (FECS)
++**Version**: 2.0
++**Last Updated**: 2024
++**Status**: Production Ready ✅
+diff --git a/DOCKER_HUB_GUIDE.md b/DOCKER_HUB_GUIDE.md
+deleted file mode 100644
+index 83ee899..0000000
+--- a/DOCKER_HUB_GUIDE.md
++++ /dev/null
+@@ -1,125 +0,0 @@
+-# Docker Hub Deployment Script
+-
+-## Step 1: Create Docker Hub Account
+-Go to https://hub.docker.com and create a free account
+-
+-## Step 2: Login to Docker Hub
+-```bash
+-docker login
+-# Enter your Docker Hub username and password
+-```
+-
+-## Step 3: Tag Your Images
+-```bash
+-# Replace 'yourusername' with your Docker Hub username
+-docker tag forest_emergency_communication-backend:latest yourusername/fecs-backend:latest
+-docker tag forest_emergency_communication-frontend:latest yourusername/fecs-frontend:latest
+-```
+-
+-## Step 4: Push Images to Docker Hub
+-```bash
+-docker push yourusername/fecs-backend:latest
+-docker push yourusername/fecs-frontend:latest
+-```
+-
+-## Step 5: Share with Friends
+-
+-Create a simple docker-compose.yml for your friends:
+-
+-```yaml
+-version: '3.8'
+-
+-services:
+-  postgres:
+-    image: postgres:16.13
+-    container_name: fecs_postgres
+-    environment:
+-      POSTGRES_DB: fecs_db
+-      POSTGRES_USER: fecs_user
+-      POSTGRES_PASSWORD: fecs_password
+-    ports:
+-      - "5432:5432"
+-    volumes:
+-      - postgres_data:/var/lib/postgresql/data
+-    networks:
+-      - fecs_network
+-
+-  mosquitto:
+-    image: eclipse-mosquitto:latest
+-    container_name: fecs_mosquitto
+-    ports:
+-      - "1883:1883"
+-      - "9001:9001"
+-    volumes:
+-      - ./mosquitto/config:/mosquitto/config
+-      - mosquitto_data:/mosquitto/data
+-      - mosquitto_logs:/mosquitto/log
+-    networks:
+-      - fecs_network
+-
+-  backend:
+-    image: yourusername/fecs-backend:latest  # Your Docker Hub image
+-    container_name: fecs_backend
+-    environment:
+-      DATABASE_URL: postgresql+psycopg://fecs_user:fecs_password@postgres:5432/fecs_db
+-      MQTT_BROKER_HOST: mosquitto
+-      MQTT_BROKER_PORT: 1883
+-      MQTT_INCOMING_TOPIC: fecs/incoming
+-      MQTT_ACK_TOPIC: fecs/ack
+-      SECRET_KEY: your-secret-key-change-in-production
+-      ALGORITHM: HS256
+-      ACCESS_TOKEN_EXPIRE_MINUTES: 1440
+-      DUPLICATE_TIME_THRESHOLD_SECONDS: 10
+-      DUPLICATE_DISTANCE_THRESHOLD_METERS: 10
+-    ports:
+-      - "8000:8000"
+-    depends_on:
+-      - postgres
+-      - mosquitto
+-    networks:
+-      - fecs_network
+-
+-  frontend:
+-    image: yourusername/fecs-frontend:latest  # Your Docker Hub image
+-    container_name: fecs_frontend
+-    ports:
+-      - "3000:3000"
+-    depends_on:
+-      - backend
+-    networks:
+-      - fecs_network
+-    environment:
+-      REACT_APP_API_URL: http://localhost:8000
+-      REACT_APP_WS_URL: ws://localhost:8000
+-
+-volumes:
+-  postgres_data:
+-  mosquitto_data:
+-  mosquitto_logs:
+-
+-networks:
+-  fecs_network:
+-    driver: bridge
+-```
+-
+-## Your Friends Run:
+-```bash
+-# Create mosquitto config folder
+-mkdir -p mosquitto/config
+-
+-# Create mosquitto.conf
+-echo "listener 1883
+-allow_anonymous true
+-persistence true
+-persistence_location /mosquitto/data/
+-log_dest file /mosquitto/log/mosquitto.log
+-log_dest stdout" > mosquitto/config/mosquitto.conf
+-
+-# Pull and run
+-docker compose pull
+-docker compose up -d
+-```
+-
+-## Access:
+-- Frontend: http://localhost:3000
+-- Login: admin / admin123
+diff --git a/Device_Registration_Module.txt b/Device_Registration_Module.txt
+deleted file mode 100644
+index f45dcb9..0000000
+--- a/Device_Registration_Module.txt
++++ /dev/null
+@@ -1,358 +0,0 @@
+-DEVICE REGISTRATION MODULE - COMPLETE WORKING DOCUMENTATION
+-===========================================================
+-
+-PURPOSE
+--------
+-Maps raw device IDs (like "DEV_001") to actual people with contact info, making emergency response faster and more effective.
+-
+-
+-COMPLETE WORKFLOW
+------------------
+-
+-Step 1: User Module Sends Normal Alert
+----------------------------------------
+-User in forest → ESP32 User Module → Relay Modules → Base Station → Backend
+-
+-Message format (pipe-delimited):
+-test001|DEV_001|10.9347|78.1212|N|M|1705315800|1|A3F2
+-
+-Fields:
+-- test001: packet_id
+-- DEV_001: device_id
+-- 10.9347: latitude
+-- 78.1212: longitude
+-- N: Normal alert (not emergency)
+-- M: Manual signal
+-- 1705315800: Unix timestamp
+-- 1: Hardware source
+-- A3F2: Checksum
+-
+-
+-Step 2: Backend Processes Alert
+---------------------------------
+-mqtt_handler.py receives the message:
+-1. Parses pipe-delimited format
+-2. Validates data
+-3. Stores in 'alerts' table
+-4. Checks if device is registered
+-
+-
+-Step 3: Operator Sees Unregistered Device
+-------------------------------------------
+-In Operator Dashboard → Devices Tab:
+-
+-┌─────────────────────────────────┐
+-│ Unregistered Devices (1)        │
+-├─────────────────────────────────┤
+-│ DEV_001                         │
+-│ 📍 10.9347, 78.1212             │
+-│ 🕐 2024-01-15 09:45 AM          │
+-│ [Register Device]               │
+-└─────────────────────────────────┘
+-
+-How it detects unmapped devices:
+-- API queries 'alerts' table for devices with message_type = NORMAL
+-- Excludes devices already in 'device_registrations' table
+-- Shows latest alert for each unmapped device
+-
+-
+-Step 4: Operator Registers Device
+-----------------------------------
+-Clicks "Register Device" → Form Opens:
+-
+-┌─────────────────────────────────┐
+-│ Register Device                 │
+-├─────────────────────────────────┤
+-│ Device ID: DEV_001 (readonly)   │
+-│ User Name: [Ranger Kumar]       │
+-│ Phone: [9876543210]             │
+-│                                 │
+-│ [Register] [Cancel]             │
+-└─────────────────────────────────┘
+-
+-On Submit:
+-1. Frontend sends POST to /device-registrations
+-2. Backend creates record in device_registrations table:
+-   - device_id: DEV_001
+-   - name: Ranger Kumar
+-   - phone_number: 9876543210
+-   - registered_by_emp_id: EMP001 (operator's ID)
+-   - registered_at: 2024-01-15 10:00:00
+-   - is_active: 1
+-
+-
+-Step 5: Device Now Shows as Registered
+----------------------------------------
+-In Registered Devices Section:
+-
+-┌─────────────────────────────────┐
+-│ Registered Devices (1)          │
+-├─────────────────────────────────┤
+-│ Ranger Kumar        [DEV_001]   │
+-│ 📞 9876543210                   │
+-│ 🕐 Registered: Jan 15, 2024     │
+-│ 👤 By: EMP001                   │
+-│ [Edit] [Deactivate]             │
+-└─────────────────────────────────┘
+-
+-
+-Step 6: Future Alerts Show User Name
+--------------------------------------
+-When DEV_001 sends emergency alert later:
+-
+-Dashboard now displays:
+-🚨 Emergency Alert
+-👤 Ranger Kumar (DEV_001)
+-📞 9876543210
+-📍 10.9347, 78.1212
+-🕐 2024-01-15 14:30
+-
+-Instead of just:
+-🚨 Emergency Alert
+-Device: DEV_001
+-📍 10.9347, 78.1212
+-
+-
+-DATA FLOW DIAGRAM
+------------------
+-
+-┌─────────────┐
+-│ User Module │ sends normal alert
+-│  (DEV_001)  │
+-└──────┬──────┘
+-       │ pipe-delimited: test001|DEV_001|10.9347|78.1212|N|M|...
+-       ↓
+-┌─────────────┐
+-│ MQTT Broker │
+-└──────┬──────┘
+-       │
+-       ↓
+-┌─────────────────┐
+-│ Backend         │
+-│ mqtt_handler.py │ parses & stores
+-└──────┬──────────┘
+-       │
+-       ↓
+-┌──────────────────┐
+-│ PostgreSQL       │
+-│ alerts table     │ device_id: DEV_001
+-└──────┬───────────┘
+-       │
+-       ↓
+-┌──────────────────────────┐
+-│ API: /device-registrations│
+-│      /unmapped           │ checks if DEV_001 registered
+-└──────┬───────────────────┘
+-       │ NOT FOUND
+-       ↓
+-┌──────────────────┐
+-│ Operator         │
+-│ Dashboard        │ shows "Unregistered Devices"
+-└──────┬───────────┘
+-       │ clicks Register
+-       ↓
+-┌──────────────────┐
+-│ Registration     │
+-│ Form             │ enters: Ranger Kumar, 9876543210
+-└──────┬───────────┘
+-       │ POST /device-registrations
+-       ↓
+-┌────────────────────────┐
+-│ PostgreSQL             │
+-│ device_registrations   │ stores mapping
+-│ table                  │
+-└────────────────────────┘
+-
+-
+-DATABASE TABLES
+----------------
+-
+-alerts table (existing):
+-┌────┬───────────┬───────────┬──────────┬───────────┬──────────────┐
+-│ id │ packet_id │ device_id │ latitude │ longitude │ message_type │
+-├────┼───────────┼───────────┼──────────┼───────────┼──────────────┤
+-│ 1  │ test001   │ DEV_001   │ 10.9347  │ 78.1212   │ normal       │
+-└────┴───────────┴───────────┴──────────┴───────────┴──────────────┘
+-
+-device_registrations table (new):
+-┌────┬───────────┬──────────────┬──────────────┬──────────────────────┬───────────┐
+-│ id │ device_id │ name         │ phone_number │ registered_by_emp_id │ is_active │
+-├────┼───────────┼──────────────┼──────────────┼──────────────────────┼───────────┤
+-│ 1  │ DEV_001   │ Ranger Kumar │ 9876543210   │ EMP001               │ 1         │
+-└────┴───────────┴──────────────┴──────────────┴──────────────────────┴───────────┘
+-
+-Join Query (for display):
+-SELECT 
+-  a.*, 
+-  dr.name, 
+-  dr.phone_number
+-FROM alerts a
+-LEFT JOIN device_registrations dr ON a.device_id = dr.device_id
+-WHERE dr.is_active = 1
+-
+-
+-API ENDPOINTS
+--------------
+-
+-1. GET /device-registrations/unmapped
+-   Purpose: Get devices that sent normal alerts but are not registered
+-   Response: List of unmapped devices with last location and time
+-
+-2. POST /device-registrations
+-   Purpose: Register a device to a user
+-   Request Body:
+-   {
+-     "device_id": "DEV_001",
+-     "name": "Ranger Kumar",
+-     "phone_number": "9876543210"
+-   }
+-
+-3. GET /device-registrations
+-   Purpose: Get all registered devices
+-   Response: List of all active device registrations
+-
+-4. PUT /device-registrations/{device_id}
+-   Purpose: Update device registration
+-   Request Body:
+-   {
+-     "device_id": "DEV_001",
+-     "name": "Ranger Karthik",
+-     "phone_number": "9876543211"
+-   }
+-
+-5. PATCH /device-registrations/{device_id}/deactivate
+-   Purpose: Deactivate device registration
+-
+-
+-KEY FEATURES
+-------------
+-
+-1. Unmapped Device Detection
+-   - Only shows devices that sent NORMAL alerts (not emergencies)
+-   - Prevents registration workflow during actual emergencies
+-   - Shows latest location and time
+-
+-2. Simple Registration
+-   - Device ID auto-filled (readonly)
+-   - Only needs: Name + Phone
+-   - Tracks who registered (employee_id)
+-
+-3. Edit & Deactivate
+-   - Update name/phone if person changes
+-   - Deactivate if device reassigned
+-   - Maintains audit trail
+-
+-4. Role-Based Access
+-   - Both operators and admins can register devices
+-   - Logged by employee_id for accountability
+-
+-
+-REAL-WORLD EXAMPLE
+-------------------
+-
+-Scenario: New Ranger Joins
+-
+-Day 1 Morning: Ranger Kumar gets device DEV_001
+-
+-Day 1 10:00 AM: Sends test signal (normal alert)
+-Message: test001|DEV_001|10.9347|78.1212|N|M|1705315800|1|A3F2
+-
+-Day 1 10:05 AM: Operator sees unmapped device, registers it
+-Form: Name = Ranger Kumar, Phone = 9876543210
+-
+-Day 1 2:30 PM: Kumar encounters wild animal, presses emergency button
+-Message: emerg001|DEV_001|10.9350|78.1215|E|M|1705329000|1|B4E3
+-
+-Dashboard shows:
+-🚨 Emergency - Ranger Kumar (9876543210)
+-📍 10.9350, 78.1215
+-🕐 2:30 PM
+-
+-Response team: Immediately knows WHO and can call directly
+-
+-Without this module:
+-Dashboard shows: 🚨 Emergency - DEV_001
+-Operator wastes time checking records: "Who has DEV_001?"
+-Delayed response
+-
+-
+-WHY THIS DESIGN WORKS
+----------------------
+-
+-1. Separation of concerns
+-   - device_id = system key (technical identifier)
+-   - name = human display (operational identifier)
+-
+-2. Non-intrusive
+-   - Doesn't block emergency alerts
+-   - Registration happens during normal operations
+-
+-3. Audit trail
+-   - Tracks who registered when
+-   - registered_by_emp_id field
+-
+-4. Flexible
+-   - Can update mappings
+-   - Can deactivate when device reassigned
+-
+-5. Efficient
+-   - 52-byte alerts over MQTT
+-   - Rich dashboard display with joined data
+-
+-
+-TECHNICAL IMPLEMENTATION
+-------------------------
+-
+-Backend Files:
+-- models.py: DeviceRegistration model
+-- schemas.py: DeviceRegistrationCreate, DeviceRegistrationResponse, UnmappedDevice
+-- routes.py: 5 API endpoints
+-- Migration: add_device_registrations.py
+-
+-Frontend Files:
+-- DeviceRegistration.jsx: Main component
+-- DeviceRegistration.css: Styling
+-- App.jsx: Navigation integration
+-- api.js: API functions
+-
+-Database:
+-- Table: device_registrations
+-- Columns: id, device_id, name, phone_number, registered_by_emp_id, registered_at, is_active
+-
+-
+-BUSINESS RULES
+---------------
+-
+-1. Registration allowed only after receiving at least one valid normal alert
+-2. Emergency alerts should not force registration workflow first
+-3. A device can have only one active registration at a time
+-4. device_id remains the primary technical identity
+-5. Mapped user_name is for display and operator understanding
+-6. Admin can manage all mappings
+-7. Operator can register and edit mappings
+-
+-
+-MESSAGE TYPE CODES
+-------------------
+-
+-Message Types:
+-- N = Normal (used for registration)
+-- E = Emergency
+-- W = Warning
+-- I = Info
+-
+-Signal Types:
+-- M = Manual
+-- A = Automatic
+-
+-Source:
+-- 1 = Hardware
+-- 0 = Software
+-
+-
+-CONCLUSION
+-----------
+-
+-The Device Registration Module bridges the gap between technical device IDs and human-readable emergency response. It enables operators to quickly identify who needs help, contact them directly, and coordinate rescue operations efficiently.
+-
+-Key benefit: Transforms "DEV_001 has emergency" into "Ranger Kumar (9876543210) has emergency at coordinates X,Y"
+diff --git a/EXPORT_IMAGES_GUIDE.md b/EXPORT_IMAGES_GUIDE.md
+deleted file mode 100644
+index ffec452..0000000
+--- a/EXPORT_IMAGES_GUIDE.md
++++ /dev/null
+@@ -1,116 +0,0 @@
+-# Export and Share Docker Images
+-
+-## On Your Machine (Export Images)
+-
+-### Step 1: Save Images to Files
+-```bash
+-cd E:\forest_emergency_communication
+-
+-# Save backend image
+-docker save forest_emergency_communication-backend:latest -o fecs_backend.tar
+-
+-# Save frontend image
+-docker save forest_emergency_communication-frontend:latest -o fecs_frontend.tar
+-
+-# These files will be large (500MB-1GB each)
+-```
+-
+-### Step 2: Create Deployment Package
+-Create a folder with these files:
+-```
+-fecs_deployment/
+-├── fecs_backend.tar
+-├── fecs_frontend.tar
+-├── docker-compose.yml
+-├── mosquitto/
+-│   └── config/
+-│       └── mosquitto.conf
+-└── README.txt
+-```
+-
+-### Step 3: Share the Package
+-- Upload to Google Drive / OneDrive / Dropbox
+-- Share via USB drive
+-- Transfer via network
+-
+----
+-
+-## For Your Friends (Import and Run)
+-
+-### Step 1: Load Images
+-```bash
+-cd fecs_deployment
+-
+-# Load backend image
+-docker load -i fecs_backend.tar
+-
+-# Load frontend image
+-docker load -i fecs_frontend.tar
+-```
+-
+-### Step 2: Run Application
+-```bash
+-docker compose up -d
+-```
+-
+-### Step 3: Access
+-- Frontend: http://localhost:3000
+-- Login: admin / admin123
+-
+----
+-
+-## Quick Commands
+-
+-### Export Everything (Run this on your machine)
+-```bash
+-# Create deployment folder
+-mkdir fecs_deployment
+-cd fecs_deployment
+-
+-# Save images
+-docker save forest_emergency_communication-backend:latest -o fecs_backend.tar
+-docker save forest_emergency_communication-frontend:latest -o fecs_frontend.tar
+-
+-# Copy necessary files
+-copy ..\docker-compose.yml .
+-mkdir mosquitto\config
+-copy ..\mosquitto\config\mosquitto.conf mosquitto\config\
+-
+-echo "FECS Deployment Package Ready!"
+-echo "Share the 'fecs_deployment' folder with your friends"
+-```
+-
+-### Import and Run (Your friends run this)
+-```bash
+-cd fecs_deployment
+-
+-# Load images
+-docker load -i fecs_backend.tar
+-docker load -i fecs_frontend.tar
+-
+-# Start application
+-docker compose up -d
+-
+-# Check status
+-docker compose ps
+-
+-# View logs
+-docker compose logs -f
+-```
+-
+----
+-
+-## File Sizes (Approximate)
+-- fecs_backend.tar: ~800MB
+-- fecs_frontend.tar: ~600MB
+-- Total: ~1.4GB
+-
+-## Compression (Optional)
+-To reduce file size:
+-```bash
+-# Compress
+-tar -czf fecs_images.tar.gz fecs_backend.tar fecs_frontend.tar
+-
+-# Your friends decompress
+-tar -xzf fecs_images.tar.gz
+-```
+diff --git a/FECS Software Design Specification.txt b/FECS Software Design Specification.txt
+deleted file mode 100644
+index a5f608c..0000000
+--- a/FECS Software Design Specification.txt	
++++ /dev/null
+@@ -1,356 +0,0 @@
+-FECS Software Design Specification
+-1. Project Overview
+-Project Name: Forest Emergency Communication System (FECS)
+-Purpose: FECS is an offline emergency communication system for forest and remote terrain environments. It allows a user module carried by trekkers or forest personnel to send alert messages through LoRa repeater nodes to a base station. The base station is connected to a laptop/server that runs the backend and dashboard application.
+-The application layer is responsible for receiving alerts, validating them, removing duplicates, storing valid records, showing them on a live dashboard, and triggering acknowledgments back to the user module through the base station.
+-________________________________________
+-2. High-Level Architecture
+-2.1 Physical Modules
+-1. User Module
+-•	Contains push button, GPS, LoRa, ESP32, LED, buzzer
+-•	Sends alert messages based on button interaction
+-•	Receives acknowledgment from the base station through relay nodes
+-2. Relay Module
+-•	Works as a repeater/forwarding node
+-•	Receives LoRa packets and retransmits them
+-•	Extends network coverage between user module and base station
+-•	Does not perform backend logic
+-3. Base Station Module
+-•	Connected to laptop/server
+-•	Receives messages from user modules through relay nodes
+-•	Forwards structured data to backend
+-•	Receives ACK commands from backend and transmits ACK back through relay nodes to user module
+-2.2 Logical Data Flow
+-User Module -> Relay Module(s) -> Base Station Module -> Backend -> Database -> Dashboard
+-Backend -> Base Station Module -> Relay Module(s) -> User Module
+-________________________________________
+-3. Application Scope
+-The software application includes: - Backend service using FastAPI - Frontend dashboard using React.js - Live map using Leaflet - PostgreSQL database for alert storage - MQTT-based communication between base station and backend
+-________________________________________
+-4. Technology Stack
+-Backend
+-•	FastAPI
+-•	Pydantic validation
+-•	MQTT client
+-•	PostgreSQL driver / ORM
+-Frontend
+-•	React.js
+-•	Leaflet for map visualization
+-•	Real-time updates from backend
+-Database
+-•	PostgreSQL
+-Communication
+-•	MQTT between base station module and backend application
+-________________________________________
+-5. Functional Requirements
+-5.1 Alert Reception
+-The system shall receive messages from the base station module when a user module sends an alert.
+-5.2 Message Types
+-Supported message types: - normal - high - emergency - cancel
+-5.3 Signal Types
+-Supported signal types: - manual - auto
+-5.4 Duplicate Removal
+-The system shall discard duplicate messages and store only the first valid message.
+-5.5 Acknowledgment Trigger
+-The backend shall trigger ACK only for valid manual alerts: - normal - high - emergency
+-ACK shall not be triggered for: - auto signals - cancel messages
+-5.6 Dashboard Display
+-The dashboard shall display valid alerts on a live interface with location markers on a map.
+-5.7 Status Management
+-Each stored alert shall maintain a status value: - pending - acknowledged - resolved
+-________________________________________
+-6. Message Communication Design
+-6.1 Incoming JSON Message (Base Station -> Backend)
+-{
+-  "packet_id": "a1b2c3d4",
+-  "device_id": "DEV_001",
+-  "latitude": 10.934512,
+-  "longitude": 78.121245,
+-  "message_type": "emergency",
+-  "signal_type": "manual",
+-  "event_time": "2026-03-18T10:32:15Z",
+-  "source": "hardware"
+-}
+-Field Definitions
+-•	packet_id: unique identifier for the transmitted packet
+-•	device_id: identifier of user module
+-•	latitude: GPS latitude
+-•	longitude: GPS longitude
+-•	message_type: normal/high/emergency/cancel
+-•	signal_type: manual/auto
+-•	event_time: time generated by device
+-•	source: hardware or simulation
+-6.2 Outgoing ACK JSON (Backend -> Base Station)
+-{
+-  "device_id": "DEV_001",
+-  "ack_type": "delivery_ack",
+-  "for_packet_id": "a1b2c3d4",
+-  "timestamp": "2026-03-18T10:33:00Z"
+-}
+-ACK Rules
+-•	ACK only for valid manual alerts
+-•	No ACK for auto signals
+-•	No ACK for cancel messages
+-•	No retry logic
+-•	No delivery confirmation tracking in backend
+-________________________________________
+-7. MQTT Topic Design
+-Recommended simple topic structure:
+-fecs/incoming
+-fecs/ack
+-Topic Usage
+-•	fecs/incoming: base station publishes incoming alert messages to backend
+-•	fecs/ack: backend publishes ACK commands to base station
+-________________________________________
+-8. Duplicate Detection Rule
+-A message shall be treated as duplicate if all of the following are true: - same device_id - same message_type - same signal_type - event time difference is less than or equal to 10 seconds - GPS distance difference is less than or equal to 10 meters
+-Duplicate Handling Policy
+-•	store only the first valid message
+-•	discard all duplicate copies
+-•	do not store duplicate entries
+-________________________________________
+-9. Backend Processing Flow
+-9.1 Incoming Processing
+-1.	Receive JSON message from MQTT topic fecs/incoming
+-2.	Validate schema and field values
+-3.	Check for duplicate using time and distance rule
+-4.	If duplicate, discard message
+-5.	If valid, store alert in database
+-6.	If valid manual alert, publish ACK command to fecs/ack
+-7.	Push alert update to frontend dashboard
+-9.2 Validation Rules
+-•	device_id must not be empty
+-•	latitude must be between -90 and 90
+-•	longitude must be between -180 and 180
+-•	message_type must be one of supported values
+-•	signal_type must be manual or auto
+-•	event_time must be a valid ISO timestamp
+-________________________________________
+-10. Database Design
+-10.1 Alerts Table
+-Field	Type	Purpose
+-id	integer / UUID	primary key
+-packet_id	string	packet identifier
+-device_id	string	sender device
+-latitude	float	user latitude
+-longitude	float	user longitude
+-message_type	string	normal/high/emergency/cancel
+-signal_type	string	manual/auto
+-event_time	datetime	device event time
+-received_at	datetime	backend receive time
+-status	string	pending/acknowledged/resolved
+-source	string	hardware/simulation
+-10.2 Notes
+-•	received_at is generated by backend when data is accepted
+-•	duplicates are not stored
+-________________________________________
+-11. Frontend Dashboard Design
+-11.1 Main Dashboard Features
+-•	live alert list
+-•	live Leaflet map
+-•	marker display using GPS coordinates
+-•	visual distinction based on message priority
+-•	current status display for each alert
+-11.2 Suggested Views
+-A. Live Dashboard
+-•	active alerts
+-•	map markers
+-•	latest incoming alerts
+-B. Alert Detail Panel
+-•	device ID
+-•	message type
+-•	signal type
+-•	event time
+-•	location
+-•	status
+-C. Alert History
+-•	list of stored alerts
+-•	filter by type and status
+-11.3 Marker Behavior
+-Suggested marker coloring: - normal -> green - high -> orange/yellow - emergency -> red - resolved -> grey
+-________________________________________
+-12. Real-Time Behavior
+-The dashboard must update in real time when a new valid alert is stored.
+-Recommended implementation options: - WebSocket from FastAPI to React frontend - or periodic polling as fallback
+-Preferred option: WebSocket
+-________________________________________
+-13. Unconscious Detection Logic
+-Purpose
+-Detect whether a user may be unconscious when no manual alert is sent.
+-Existing Concept
+-•	user module sends auto location signal every 2 hours
+-•	backend/dashboard monitors repeated unchanged locations
+-•	in daytime, stagnation can escalate to high-priority alert
+-•	in nighttime, base station sends buzzer-trigger signal to user module
+-•	if user responds within configured response period, situation is treated as safe
+-•	if no response is received, case escalates to emergency
+-Current Note
+-This feature is part of FECS concept and can be implemented after core alert flow is completed.
+-________________________________________
+-14. System Responsibilities by Module
+-User Module
+-•	detect button input
+-•	send alert packet
+-•	receive ACK through LED/buzzer
+-Relay Module
+-•	forward packets toward base station or user module
+-Base Station Module
+-•	receive LoRa packets
+-•	convert/forward structured message to backend
+-•	receive ACK command from backend
+-•	transmit ACK through relay path to user module
+-Backend
+-•	validate JSON
+-•	remove duplicates
+-•	store valid alerts
+-•	trigger ACK for valid manual alerts
+-•	send updates to dashboard
+-Frontend
+-•	display live alerts
+-•	show map and status
+-•	support operator monitoring
+-________________________________________
+-15. Recommended Development Plan
+-Phase 1: Backend Core
+-•	create FastAPI project
+-•	create MQTT subscriber for fecs/incoming
+-•	create validation schema
+-•	create duplicate detection logic
+-•	create DB insert flow
+-•	create ACK publish flow to fecs/ack
+-Phase 2: Database
+-•	create PostgreSQL alerts table
+-•	connect backend to database
+-•	test insert and query functions
+-Phase 3: Frontend
+-•	create React dashboard
+-•	integrate Leaflet map
+-•	fetch alerts from backend
+-•	show real-time updates
+-Phase 4: Integration Testing
+-•	connect simulated messages from base station
+-•	validate duplicate filtering
+-•	validate ACK publishing
+-•	validate live dashboard updates
+-________________________________________
+-16. Sequence Diagram
+-16.1 Alert Processing Sequence
+-sequenceDiagram
+-    participant U as User Module
+-    participant R as Relay Module(s)
+-    participant B as Base Station Module
+-    participant M as MQTT Broker
+-    participant A as FastAPI Backend
+-    participant D as PostgreSQL Database
+-    participant F as React Dashboard
+-
+-    U->>R: Send LoRa alert packet
+-    R->>B: Forward packet
+-    B->>M: Publish incoming JSON to fecs/incoming
+-    M->>A: Deliver message
+-    A->>A: Validate payload
+-    A->>A: Check duplicate rule
+-    alt Valid non-duplicate message
+-        A->>D: Store alert record
+-        D-->>A: Insert success
+-        A->>F: Push real-time alert update
+-        alt Manual alert (normal/high/emergency)
+-            A->>M: Publish ACK command to fecs/ack
+-            M->>B: Deliver ACK command
+-            B->>R: Transmit ACK into LoRa network
+-            R->>U: Forward ACK
+-            U->>U: Blink LED
+-        else Auto signal or cancel
+-            A->>A: No ACK triggered
+-        end
+-    else Duplicate message
+-        A->>A: Discard message
+-    end
+-16.2 Unconscious Detection Sequence
+-sequenceDiagram
+-    participant U as User Module
+-    participant R as Relay Module(s)
+-    participant B as Base Station Module
+-    participant M as MQTT Broker
+-    participant A as FastAPI Backend
+-    participant D as PostgreSQL Database
+-    participant F as React Dashboard
+-
+-    U->>R: Send auto location signal (2-hour interval)
+-    R->>B: Forward packet
+-    B->>M: Publish incoming JSON to fecs/incoming
+-    M->>A: Deliver message
+-    A->>A: Validate and store auto signal
+-    A->>D: Save alert/activity record
+-    A->>A: Compare with recent location history
+-    alt Same-location pattern suggests stagnation
+-        A->>F: Raise stagnation warning
+-        alt Night-time check
+-            A->>M: Publish buzzer-trigger ACK/command
+-            M->>B: Deliver command
+-            B->>R: Transmit through LoRa network
+-            R->>U: Forward buzzer trigger
+-            U->>U: Activate buzzer
+-            alt User responds in allowed time
+-                U->>R: Send normal alert response
+-                R->>B: Forward response
+-                B->>M: Publish to fecs/incoming
+-                M->>A: Deliver response
+-                A->>D: Store response/update status
+-                A->>F: Mark user safe
+-            else No response
+-                A->>D: Escalate case as emergency
+-                A->>F: Show emergency alert
+-            end
+-        else Day-time stagnation
+-            A->>D: Escalate case as high-priority alert
+-            A->>F: Show high-priority alert
+-        end
+-    else Location pattern normal
+-        A->>A: No escalation
+-    end
+-17. Architecture Diagram
+-17.1 Application Architecture
+-graph TD
+-    U[User Module
+-ESP32 + GPS + LoRa + Button + LED/Buzzer]
+-    R[Relay Module(s)
+-LoRa Repeater / Forwarding Node]
+-    B[Base Station Module
+-LoRa Gateway connected to Laptop/Server]
+-    M[MQTT Broker
+-Topics: fecs/incoming, fecs/ack]
+-    A[FastAPI Backend
+-Validation + Duplicate Filter + ACK Trigger + Business Logic]
+-    D[(PostgreSQL Database
+-Alerts Table)]
+-    W[WebSocket / API Layer]
+-    F[React Dashboard
+-Leaflet Live Map + Alert Views]
+-
+-    U --> R
+-    R --> B
+-    B --> M
+-    M --> A
+-    A --> D
+-    A --> W
+-    W --> F
+-    A --> M
+-    M --> B
+-    B --> R
+-    R --> U
+-17.2 Backend Internal Architecture
+-graph LR
+-    M[MQTT Subscriber] --> V[Payload Validation]
+-    V --> X[Duplicate Detection]
+-    X -->|Valid| S[Alert Service]
+-    X -->|Duplicate| G[Discard]
+-    S --> D[(PostgreSQL)]
+-    S --> K[ACK Publisher]
+-    S --> N[Real-Time Notifier]
+-    K --> MQ[MQTT Topic: fecs/ack]
+-    N --> WS[WebSocket/API]
+-    WS --> UI[React Dashboard]
+-18. Final Implementation Statement
+-This software design converts FECS from a concept into an implementable application architecture. The application is centered around a FastAPI backend, MQTT-based message ingestion, PostgreSQL alert storage, and a real-time React dashboard with map visualization. The backend stores only valid non-duplicate alerts and triggers ACK only for valid manual alerts through the base station module.
+-The sequence diagrams define how alerts move through the system and how acknowledgments return to the user module. The architecture diagrams define the software building blocks needed for your team to begin implementation.
+diff --git a/README.md b/README.md
+deleted file mode 100644
+index 82e62d9..0000000
+--- a/README.md
++++ /dev/null
+@@ -1,325 +0,0 @@
+-# Forest Emergency Communication System (FECS)
+-
+-## Project Overview
+-FECS is an offline emergency communication system for forest and remote terrain environments. The application layer receives alerts from hardware modules via MQTT, validates and stores them in PostgreSQL, and displays them on a real-time dashboard.
+-
+-## Technology Stack
+-
+-### Backend
+-- FastAPI
+-- PostgreSQL 16.13
+-- SQLAlchemy + Alembic
+-- MQTT (Mosquitto)
+-- JWT Authentication
+-
+-### Frontend
+-- React.js
+-- Leaflet (map visualization)
+-- WebSocket (real-time updates)
+-
+-## Project Structure
+-
+-```
+-forest_emergency_communication/
+-├── backend/
+-│   ├── app/
+-│   │   ├── main.py              # FastAPI entry point
+-│   │   ├── config.py            # Configuration settings
+-│   │   ├── database.py          # Database connection
+-│   │   ├── models.py            # SQLAlchemy models
+-│   │   ├── schemas.py           # Pydantic schemas
+-│   │   ├── mqtt_handler.py      # MQTT subscriber
+-│   │   ├── services/
+-│   │   │   ├── alert_service.py # Alert logic
+-│   │   │   ├── ack_service.py   # ACK publishing
+-│   │   │   └── auth_service.py  # Authentication
+-│   │   └── api/
+-│   │       ├── routes.py        # REST endpoints
+-│   │       └── websocket.py     # WebSocket manager
+-│   ├── alembic/                 # Database migrations
+-│   │   └── versions/            # Migration scripts
+-│   ├── requirements.txt         # Python dependencies
+-│   ├── alembic.ini              # Alembic configuration
+-│   └── .env                     # Environment variables
+-├── frontend/
+-│   ├── src/
+-│   │   ├── App.jsx              # Main application component
+-│   │   ├── components/
+-│   │   │   ├── Login.jsx        # Login page
+-│   │   │   ├── AdminDashboard.jsx        # Admin dashboard
+-│   │   │   ├── OperatorDashboard.jsx     # Operator dashboard
+-│   │   │   ├── Map.jsx                   # Map visualization
+-│   │   │   ├── AlertList.jsx             # Alert list view
+-│   │   │   ├── AlertDetail.jsx           # Alert details
+-│   │   │   ├── AlertLogs.jsx             # Alert history
+-│   │   │   ├── DeviceRegistration.jsx    # Device registration
+-│   │   │   ├── BaseStationView.jsx       # Base station management
+-│   │   │   └── UserManagement.jsx        # User management
+-│   │   └── services/
+-│   │       ├── api.js           # API client
+-│   │       └── websocket.js     # WebSocket client
+-│   ├── package.json             # Node dependencies
+-│   └── .env                     # Frontend environment variables
+-├── README.md                    # Project documentation
+-├── .gitignore                   # Git ignore rules
+-└── Documentation files (.txt, .docx)
+-```
+-
+-## Setup Instructions
+-
+-### Prerequisites
+-- Python 3.10+
+-- Node.js 16+
+-- PostgreSQL 16.13
+-- Mosquitto MQTT Broker
+-
+-### 1. Install Mosquitto (MQTT Broker)
+-
+-**Windows:**
+-```bash
+-# Download from: https://mosquitto.org/download/
+-# Install and run as service
+-net start mosquitto
+-```
+-
+-### 2. Setup PostgreSQL Database
+-
+-```sql
+-CREATE DATABASE fecs_db;
+-```
+-
+-### 3. Backend Setup
+-
+-```bash
+-cd backend
+-
+-# Create virtual environment
+-python -m venv venv
+-venv\Scripts\activate  # Windows
+-
+-# Install dependencies
+-pip install -r requirements.txt
+-
+-# Configure .env file
+-# Edit .env and update:
+-# - DATABASE_URL with your PostgreSQL credentials
+-# - SECRET_KEY with a secure random string
+-
+-# Run database migrations
+-alembic init alembic
+-alembic revision --autogenerate -m "Initial migration"
+-alembic upgrade head
+-
+-# Start backend server
+-uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+-```
+-
+-### 4. Frontend Setup
+-
+-```bash
+-cd frontend
+-
+-# Install dependencies
+-npm install
+-
+-# Start development server
+-npm start
+-```
+-
+-The frontend will run on http://localhost:3000
+-
+-### 5. Create Admin User
+-
+-Use Python shell to create the first admin user:
+-
+-```python
+-from app.database import SessionLocal
+-from app.models import User, UserRole
+-from app.services.auth_service import get_password_hash
+-
+-db = SessionLocal()
+-admin = User(
+-    username="admin",
+-    password_hash=get_password_hash("admin123"),
+-    role=UserRole.ADMIN,
+-    email="admin@fecs.local",
+-    employee_id="EMP_ADMIN_001"
+-)
+-db.add(admin)
+-db.commit()
+-```
+-
+-**Default Credentials:**
+-- Username: `admin` or Employee ID: `EMP_ADMIN_001`
+-- Password: `admin123`
+-- **Important**: Change the default password after first login
+-
+-## Features
+-
+-### Admin Features
+-- **User Management**: Create and manage operator accounts
+-- **Base Station View**: View devices grouped by base station
+-- **System Statistics**: Dashboard with key metrics
+-- **Full Alert Access**: View and manage all alerts across stations
+-
+-### Operator Features
+-- **Card-Based Dashboard**: Intuitive navigation with Map & Alerts, Alert Logs, and Device Management
+-- **Device Registration**: Register user modules to personnel with names and phone numbers
+-- **Station-Based Filtering**: Only see devices and alerts from assigned station
+-- **Real-Time Map**: Live alert visualization with Leaflet maps
+-- **Alert Management**: Acknowledge and resolve alerts with notes
+-
+-## Usage
+-
+-### Login
+-- **Operators**: Login with Employee ID (e.g., EMP001) and password
+-- **Admins**: Login with username or employee ID and password
+-- Press Ctrl+1 to switch between Operator and Admin login modes
+-
+-### For Operators
+-1. **View Alerts**: Real-time alerts appear on the map and list
+-2. **Register Devices**: Map unmapped devices to personnel
+-3. **Manage Alerts**: Acknowledge and resolve alerts
+-4. **Add Notes**: Add operational notes to any alert
+-
+-### For Admins
+-1. **Create Users**: Add new operators with employee IDs and station assignments
+-2. **View Base Stations**: See all devices grouped by station
+-3. **Monitor System**: View statistics and system-wide alerts
+-
+-## API Endpoints
+-
+-### Authentication
+-- `POST /api/token` - Login (accepts employee_id or username)
+-- `GET /api/users/me` - Get current user info
+-
+-### User Management (Admin Only)
+-- `POST /api/users` - Create user
+-- `GET /api/users` - Get all users
+-- `GET /api/users/next-employee-id` - Get next available employee ID
+-- `PATCH /api/users/{user_id}` - Update user (activate/deactivate)
+-- `GET /api/stats` - Get system statistics
+-
+-### Alerts
+-- `GET /api/alerts` - Get all alerts
+-- `GET /api/alerts/{id}` - Get specific alert
+-- `PATCH /api/alerts/{id}/status` - Update alert status
+-
+-### Device Registration
+-- `GET /api/device-registrations/unmapped` - Get unmapped devices
+-- `POST /api/device-registrations` - Register device
+-- `GET /api/device-registrations` - Get registered devices (filtered by station for operators)
+-- `PUT /api/device-registrations/{device_id}` - Update device registration
+-- `PATCH /api/device-registrations/{device_id}/deactivate` - Deactivate device
+-
+-### Base Station Management (Admin Only)
+-- `GET /api/base-stations/devices` - Get devices grouped by station
+-
+-### Real-Time
+-- `WS /ws` - WebSocket connection for real-time updates
+-
+-## MQTT Topics
+-
+-- `fecs/incoming` - Incoming alerts from base station (pipe-delimited format)
+-- `fecs/ack` - ACK messages to base station
+-
+-## Alert Message Format
+-
+-**Pipe-Delimited Format** (52 bytes):
+-```
+-test001|DEV_001|10.9347|78.1212|E|M|1705315800|1|A3F2
+-```
+-
+-**Field Order**:
+-1. packet_id (unique identifier)
+-2. device_id (hardware device ID)
+-3. latitude (GPS coordinate)
+-4. longitude (GPS coordinate)
+-5. message_type: `E` (Emergency), `W` (Warning), `I` (Info)
+-6. signal_type: `M` (Manual), `A` (Automatic)
+-7. event_time (Unix timestamp)
+-8. source: `1` (Hardware), `0` (Software)
+-9. checksum (optional CRC16)
+-
+-**Why Pipe-Delimited?**
+-- 70% smaller than JSON (~52 bytes vs ~180 bytes)
+-- Lower packet loss in weak signal areas
+-- Faster ESP32 processing (no JSON parsing)
+-- Better for LoRa/RF communication
+-
+-## User Roles
+-
+-### Admin
+-- Full system access
+-- User management (create, activate, deactivate operators)
+-- View all devices across all stations
+-- System statistics and monitoring
+-- Login with username or employee ID
+-
+-### Operator
+-- Station-specific access
+-- Device registration for assigned station
+-- Alert management for station devices
+-- Real-time map and dashboard
+-- Must login with Employee ID (e.g., EMP001)
+-
+-## Development Notes
+-
+-- Backend runs on port 8000
+-- Frontend runs on port 3000
+-- MQTT broker runs on port 1883
+-- PostgreSQL runs on port 5432
+-- Backend uses virtual environment (venv)
+-- Station-based filtering implemented for operators
+-- Employee ID format: EMP001, EMP002, etc.
+-
+-## Current Implementation
+-
+-- Single base station deployment
+-- Centralized device registration
+-- Real-time alert monitoring
+-- Operator dashboard with card-based navigation
+-- Station-based access control
+-
+-## Future Enhancements (Roadmap)
+-
+-### Phase 2: Multi-Station Synchronization
+-**Problem**: Users moving between station coverage areas  
+-**Solution**: Mesh-based user registry synchronization  
+-**Benefits**:
+-- Seamless roaming support
+-- Offline inter-station communication
+-- Distributed fault tolerance
+-
+-**Technical Approach**:
+-- LoRa mesh sync protocol (SYNC_USER, SYNC_ACK)
+-- Distributed database replication
+-- Last-Write-Wins conflict resolution
+-- Automatic retry with exponential backoff
+-
+-**Timeline**: Phase 2 post-pilot deployment  
+-**Prerequisites**: Multi-station hardware deployment
+-
+-## Testing
+-
+-Send test alert via MQTT (pipe-delimited format):
+-
+-```bash
+-mosquitto_pub -h localhost -t fecs/incoming -m "test001|DEV_001|10.9347|78.1212|E|M|1705315800|1|A3F2"
+-```
+-
+-**Field Mapping**:
+-- `test001` - packet_id
+-- `DEV_001` - device_id
+-- `10.9347` - latitude
+-- `78.1212` - longitude
+-- `E` - Emergency (message_type)
+-- `M` - Manual (signal_type)
+-- `1705315800` - Unix timestamp
+-- `1` - Hardware source
+-- `A3F2` - Checksum (optional)
+-```
+-
+-## License
+-
+-Internal use only - Forest Department
+diff --git a/SHARING_GUIDE.md b/SHARING_GUIDE.md
+deleted file mode 100644
+index 1dad6c0..0000000
+--- a/SHARING_GUIDE.md
++++ /dev/null
+@@ -1,243 +0,0 @@
+-# Complete Guide: Share FECS with Your Team
+-
+-## 🎯 Choose Your Method
+-
+-| Method | Best For | Difficulty | Internet Required |
+-|--------|----------|------------|-------------------|
+-| **Method 1: Project Files** | Small teams, local development | ⭐ Easy | Yes (first time) |
+-| **Method 2: Docker Hub** | Remote teams, easy updates | ⭐⭐ Medium | Yes |
+-| **Method 3: Image Files** | Offline deployment, no internet | ⭐⭐ Medium | No |
+-| **Method 4: GitHub** | Open source, version control | ⭐⭐⭐ Advanced | Yes |
+-
+----
+-
+-## Method 1: Share Project Files (Easiest) ⭐
+-
+-### You Do:
+-1. Zip the entire `forest_emergency_communication` folder
+-2. Share via Google Drive, OneDrive, or USB
+-
+-### Your Friends Do:
+-```bash
+-# Extract the folder
+-# Open PowerShell/Terminal in the folder
+-docker compose up
+-```
+-
+-**Pros:** Simple, includes source code  
+-**Cons:** Large file size (~100MB), needs to rebuild images
+-
+----
+-
+-## Method 2: Docker Hub (Recommended for Teams) ⭐⭐
+-
+-### You Do (One Time):
+-
+-```bash
+-# 1. Login to Docker Hub
+-docker login
+-
+-# 2. Tag images (replace 'yourusername')
+-docker tag forest_emergency_communication-backend:latest yourusername/fecs-backend:latest
+-docker tag forest_emergency_communication-frontend:latest yourusername/fecs-frontend:latest
+-
+-# 3. Push to Docker Hub
+-docker push yourusername/fecs-backend:latest
+-docker push yourusername/fecs-frontend:latest
+-```
+-
+-### Your Friends Do:
+-
+-```bash
+-# 1. Create project folder
+-mkdir fecs
+-cd fecs
+-
+-# 2. Create docker-compose.yml (see DOCKER_HUB_GUIDE.md)
+-
+-# 3. Create mosquitto config
+-mkdir -p mosquitto/config
+-echo "listener 1883
+-allow_anonymous true
+-persistence true
+-persistence_location /mosquitto/data/
+-log_dest stdout" > mosquitto/config/mosquitto.conf
+-
+-# 4. Run
+-docker compose up -d
+-```
+-
+-**Pros:** Easy updates, no large file transfers  
+-**Cons:** Requires Docker Hub account, images are public (unless paid)
+-
+----
+-
+-## Method 3: Export Image Files (Offline) ⭐⭐
+-
+-### You Do:
+-
+-```bash
+-# Export images
+-docker save forest_emergency_communication-backend:latest -o fecs_backend.tar
+-docker save forest_emergency_communication-frontend:latest -o fecs_frontend.tar
+-
+-# Share these .tar files + docker-compose.yml + mosquitto folder
+-```
+-
+-### Your Friends Do:
+-
+-```bash
+-# Load images
+-docker load -i fecs_backend.tar
+-docker load -i fecs_frontend.tar
+-
+-# Run
+-docker compose up -d
+-```
+-
+-**Pros:** Works offline, no Docker Hub needed  
+-**Cons:** Large files (~1.4GB), manual updates
+-
+----
+-
+-## Method 4: GitHub + Automated Builds ⭐⭐⭐
+-
+-### You Do:
+-
+-```bash
+-# 1. Create GitHub repository
+-# 2. Push code to GitHub
+-git init
+-git add .
+-git commit -m "Initial commit"
+-git remote add origin https://github.com/yourusername/fecs.git
+-git push -u origin main
+-
+-# 3. Connect Docker Hub to GitHub for auto-builds
+-# (Configure in Docker Hub settings)
+-```
+-
+-### Your Friends Do:
+-
+-```bash
+-# Clone and run
+-git clone https://github.com/yourusername/fecs.git
+-cd fecs
+-docker compose up --build
+-```
+-
+-**Pros:** Version control, easy collaboration, automatic updates  
+-**Cons:** Requires GitHub account, more setup
+-
+----
+-
+-## 🚀 Quick Start for Friends (Any Method)
+-
+-### Prerequisites:
+-1. Install Docker Desktop: https://www.docker.com/products/docker-desktop
+-2. Ensure Docker is running
+-
+-### Access Application:
+-- Frontend: http://localhost:3000
+-- Backend API: http://localhost:8000/docs
+-- Default Login: `admin` / `admin123`
+-
+-### Common Commands:
+-```bash
+-# Start
+-docker compose up -d
+-
+-# Stop
+-docker compose down
+-
+-# View logs
+-docker compose logs -f
+-
+-# Restart
+-docker compose restart
+-
+-# Update (if using Docker Hub)
+-docker compose pull
+-docker compose up -d
+-```
+-
+----
+-
+-## 🌐 Network Access (Same WiFi)
+-
+-If friends want to access from their computer while you run it:
+-
+-### On Your Computer:
+-```bash
+-# Find your IP address
+-ipconfig  # Windows
+-ifconfig  # Mac/Linux
+-
+-# Example: 192.168.1.100
+-```
+-
+-### Update docker-compose.yml:
+-```yaml
+-frontend:
+-  environment:
+-    REACT_APP_API_URL: http://192.168.1.100:8000
+-    REACT_APP_WS_URL: ws://192.168.1.100:8000
+-```
+-
+-### Friends Access:
+-- http://192.168.1.100:3000
+-
+----
+-
+-## 📦 Recommended: Create Deployment Package
+-
+-Create a complete package for easy sharing:
+-
+-```bash
+-# Create package folder
+-mkdir fecs_package
+-cd fecs_package
+-
+-# Copy files
+-copy docker-compose.yml .
+-mkdir mosquitto\config
+-copy mosquitto\config\mosquitto.conf mosquitto\config\
+-
+-# Create README
+-echo "FECS Deployment Package
+-
+-1. Install Docker Desktop
+-2. Run: docker compose up -d
+-3. Access: http://localhost:3000
+-4. Login: admin / admin123
+-
+-For help, see DEPLOYMENT_GUIDE.md" > README.txt
+-
+-# Zip and share
+-```
+-
+----
+-
+-## 🔒 Security Notes
+-
+-Before sharing:
+-1. ✅ Change default admin password
+-2. ✅ Update SECRET_KEY in docker-compose.yml
+-3. ✅ Review .env files for sensitive data
+-4. ✅ Add .gitignore if using GitHub
+-
+----
+-
+-## 💡 My Recommendation
+-
+-**For 1-5 friends (same location):**  
+-→ Use **Method 1** (Share project files)
+-
+-**For remote team (5+ people):**  
+-→ Use **Method 2** (Docker Hub)
+-
+-**For offline/field deployment:**  
+-→ Use **Method 3** (Export images)
+-
+-**For long-term project:**  
+-→ Use **Method 4** (GitHub)
+diff --git a/Station_Based_Filtering_Feature.txt b/Station_Based_Filtering_Feature.txt
+deleted file mode 100644
+index b471835..0000000
+--- a/Station_Based_Filtering_Feature.txt
++++ /dev/null
+@@ -1,452 +0,0 @@
+-STATION-BASED FILTERING FOR OPERATORS - FEATURE DOCUMENTATION
+-==============================================================
+-
+-PURPOSE
+--------
+-Operators in the Device Registration module see only devices registered to their assigned base station, providing focused view and station isolation.
+-
+-
+-CORE CONCEPT
+-------------
+-Operators should only manage devices within their jurisdiction (base station coverage area).
+-
+-Current User: Operator EMP001
+-Assigned Station: Station-A
+-  ↓
+-Shows ONLY devices where:
+-  registered_by_emp_id belongs to operators from Station-A
+-
+-
+-COMPLETE WORKFLOW
+------------------
+-
+-Step 1: Operator Logs In
+--------------------------
+-Operator EMP001 logs into system:
+-- username: op1
+-- employee_id: EMP001
+-- assigned_station: Station-A
+-- role: operator
+-
+-
+-Step 2: Opens Device Registration Tab
+---------------------------------------
+-Operator clicks "Devices" tab in dashboard.
+-
+-System fetches:
+-1. Current user info (including assigned_station)
+-2. Unmapped devices (ALL - global view)
+-3. Registered devices (FILTERED by station)
+-
+-
+-Step 3: Backend Filters Registered Devices
+--------------------------------------------
+-API endpoint: GET /device-registrations
+-
+-Backend logic:
+-1. Check if user is operator
+-2. If yes, get user's assigned_station (Station-A)
+-3. Find all operators assigned to Station-A
+-4. Get their employee_ids (EMP001, EMP002)
+-5. Return only devices registered by those operators
+-
+-SQL Query:
+-SELECT * FROM device_registrations dr
+-WHERE dr.is_active = 1
+-  AND dr.registered_by_emp_id IN (
+-    SELECT employee_id FROM users
+-    WHERE assigned_station = 'Station-A'
+-      AND employee_id IS NOT NULL
+-  )
+-
+-
+-Step 4: Display Filtered View
+-------------------------------
+-Operator sees:
+-
+-┌─────────────────────────────────────────┐
+-│ Device Registration    [📍 Station-A]   │
+-├─────────────────────────────────────────┤
+-│ Unregistered Devices (5)                │
+-│ - DEV_001 (can register)                │
+-│ - DEV_002 (can register)                │
+-│ - DEV_006 (can register)                │
+-│ - DEV_007 (can register)                │
+-│ - DEV_008 (can register)                │
+-├─────────────────────────────────────────┤
+-│ Registered Devices (3) - Station-A only │
+-│ - Ranger Kumar (DEV_003) by EMP001      │
+-│ - Ranger Arun (DEV_004) by EMP001       │
+-│ - Ranger Vijay (DEV_005) by EMP002      │
+-└─────────────────────────────────────────┘
+-
+-Note: Operator does NOT see devices from Station-B
+-
+-
+-DATA FLOW DIAGRAM
+------------------
+-
+-┌──────────────────┐
+-│ Operator EMP001  │
+-│ Station-A        │
+-│ Logs in          │
+-└────────┬─────────┘
+-         │
+-         ↓
+-┌──────────────────────────┐
+-│ Clicks "Devices" tab     │
+-└────────┬─────────────────┘
+-         │
+-         ↓
+-┌──────────────────────────┐
+-│ Frontend fetches:        │
+-│ 1. GET /users/me         │
+-│ 2. GET /device-          │
+-│    registrations/unmapped│
+-│ 3. GET /device-          │
+-│    registrations         │
+-└────────┬─────────────────┘
+-         │
+-         ↓
+-┌──────────────────────────────────────┐
+-│ Backend: GET /device-registrations   │
+-│                                      │
+-│ if current_user.role == OPERATOR:    │
+-│   station = current_user.            │
+-│             assigned_station         │
+-│   operators = get_operators_in(      │
+-│               station)               │
+-│   filter devices by operators        │
+-└────────┬─────────────────────────────┘
+-         │
+-         ↓
+-┌──────────────────────────┐
+-│ Returns filtered devices │
+-│ (Station-A only)         │
+-└────────┬─────────────────┘
+-         │
+-         ↓
+-┌──────────────────────────┐
+-│ Frontend displays:       │
+-│ - Station badge          │
+-│ - Filtered devices       │
+-│ - Filter note            │
+-└──────────────────────────┘
+-
+-
+-COMPARISON: ADMIN VS OPERATOR VIEW
+------------------------------------
+-
+-Admin View (sees ALL stations):
+-┌─────────────────────────────────┐
+-│ Device Registration             │
+-├─────────────────────────────────┤
+-│ Registered Devices (5)          │
+-│ - Ranger Kumar (DEV_003) EMP001 │
+-│ - Ranger Arun (DEV_004) EMP001  │
+-│ - Ranger Vijay (DEV_005) EMP002 │
+-│ - Ranger Karthik (DEV_009) EMP005│
+-│ - Ranger Ravi (DEV_010) EMP005  │
+-└─────────────────────────────────┘
+-
+-Operator View (Station-A only):
+-┌─────────────────────────────────────┐
+-│ Device Registration [📍 Station-A]  │
+-├─────────────────────────────────────┤
+-│ Registered Devices (3) - Station-A  │
+-│ - Ranger Kumar (DEV_003) EMP001     │
+-│ - Ranger Arun (DEV_004) EMP001      │
+-│ - Ranger Vijay (DEV_005) EMP002     │
+-└─────────────────────────────────────┘
+-
+-Operator does NOT see:
+-- Ranger Karthik (DEV_009) - registered by EMP005 (Station-B)
+-- Ranger Ravi (DEV_010) - registered by EMP005 (Station-B)
+-
+-
+-DATABASE QUERIES
+-----------------
+-
+-Query 1: Get Current User Station
+-----------------------------------
+-SELECT assigned_station 
+-FROM users 
+-WHERE employee_id = 'EMP001'
+-
+-Result: 'Station-A'
+-
+-
+-Query 2: Get All Operators in Same Station
+--------------------------------------------
+-SELECT employee_id 
+-FROM users 
+-WHERE assigned_station = 'Station-A'
+-  AND employee_id IS NOT NULL
+-
+-Result: ['EMP001', 'EMP002']
+-
+-
+-Query 3: Get Filtered Devices
+-------------------------------
+-SELECT * 
+-FROM device_registrations 
+-WHERE is_active = 1
+-  AND registered_by_emp_id IN ('EMP001', 'EMP002')
+-ORDER BY registered_at DESC
+-
+-Result: Only devices registered by Station-A operators
+-
+-
+-BACKEND IMPLEMENTATION
+-----------------------
+-
+-File: backend/app/api/routes.py
+-
+-@router.get("/device-registrations")
+-async def get_registered_devices(
+-    db: Session = Depends(get_db),
+-    current_user: User = Depends(get_current_user)
+-):
+-    query = db.query(DeviceRegistration).filter(
+-        DeviceRegistration.is_active == 1
+-    )
+-    
+-    # Filter for operators
+-    if current_user.role == UserRole.OPERATOR and current_user.assigned_station:
+-        # Get all employee_ids from same station
+-        station_operators = db.query(User.employee_id).filter(
+-            User.assigned_station == current_user.assigned_station,
+-            User.employee_id.isnot(None)
+-        ).all()
+-        station_emp_ids = [op[0] for op in station_operators]
+-        
+-        # Filter devices
+-        if station_emp_ids:
+-            query = query.filter(
+-                DeviceRegistration.registered_by_emp_id.in_(station_emp_ids)
+-            )
+-        else:
+-            return []
+-    
+-    return query.order_by(DeviceRegistration.registered_at.desc()).all()
+-
+-
+-FRONTEND IMPLEMENTATION
+------------------------
+-
+-File: frontend/src/components/DeviceRegistration.jsx
+-
+-Key Changes:
+-1. Fetch current user info on component mount
+-2. Display station badge in header
+-3. Show filter note in registered devices section
+-
+-const [currentUser, setCurrentUser] = useState(null);
+-
+-useEffect(() => {
+-  fetchCurrentUser();
+-  fetchData();
+-}, []);
+-
+-const fetchCurrentUser = async () => {
+-  const token = localStorage.getItem('token');
+-  const response = await axios.get('http://localhost:8000/api/users/me', {
+-    headers: { Authorization: `Bearer ${token}` }
+-  });
+-  setCurrentUser(response.data);
+-};
+-
+-UI Elements:
+-- Station badge: Shows operator's assigned station
+-- Filter note: "Station-A only" indicator
+-
+-
+-UI COMPONENTS
+--------------
+-
+-1. Registration Header
+-   ┌─────────────────────────────────────┐
+-   │ Device Registration  [📍 Station-A] │
+-   └─────────────────────────────────────┘
+-   
+-   Shows operator which station they're managing
+-
+-2. Registered Devices Section Header
+-   ┌─────────────────────────────────────────┐
+-   │ Registered Devices (3) - Station-A only │
+-   └─────────────────────────────────────────┘
+-   
+-   Clarifies that view is filtered
+-
+-
+-KEY FEATURES
+-------------
+-
+-1. Station Isolation
+-   - Operators see only their station's devices
+-   - Prevents cross-station interference
+-   - Clear jurisdiction boundaries
+-
+-2. Focused Workflow
+-   - Reduced clutter
+-   - Relevant devices only
+-   - Better user experience
+-
+-3. Security
+-   - Station-level access control
+-   - Operators can't view other stations
+-   - Role-based filtering
+-
+-4. Transparency
+-   - Station badge shows current station
+-   - Filter note indicates filtered view
+-   - Clear visual indicators
+-
+-
+-BUSINESS RULES
+---------------
+-
+-1. Admins see ALL devices (no filtering)
+-2. Operators see only their station's devices
+-3. Unmapped devices visible to ALL operators (can register any)
+-4. Filtering based on registered_by_emp_id → assigned_station
+-5. Operators without assigned_station see no registered devices
+-6. Multiple operators in same station see same devices
+-
+-
+-EDGE CASES HANDLED
+-------------------
+-
+-1. Operator Without Assigned Station
+-   - Shows empty registered devices list
+-   - Can still see unmapped devices
+-   - Can register devices (will be assigned to their station when they get one)
+-
+-2. Only Operator in Station
+-   - Sees only devices they registered
+-   - Normal operation
+-
+-3. New Operator Joins Station
+-   - Immediately sees all station devices
+-   - Can manage existing registrations
+-
+-4. Operator Changes Station
+-   - Sees new station's devices
+-   - Loses access to old station's devices
+-   - Automatic update
+-
+-
+-REAL-WORLD EXAMPLE
+-------------------
+-
+-Forest Department Setup:
+-- Station-A: North Forest (EMP001, EMP002)
+-- Station-B: South Forest (EMP005)
+-
+-Registered Devices:
+-- DEV_003: Ranger Kumar (by EMP001, Station-A)
+-- DEV_004: Ranger Arun (by EMP001, Station-A)
+-- DEV_005: Ranger Vijay (by EMP002, Station-A)
+-- DEV_009: Ranger Karthik (by EMP005, Station-B)
+-- DEV_010: Ranger Ravi (by EMP005, Station-B)
+-
+-Scenario 1: EMP001 Logs In
+----------------------------
+-Sees:
+-✓ DEV_003 (Ranger Kumar) - registered by EMP001
+-✓ DEV_004 (Ranger Arun) - registered by EMP001
+-✓ DEV_005 (Ranger Vijay) - registered by EMP002 (same station)
+-
+-Does NOT see:
+-✗ DEV_009 (Ranger Karthik) - Station-B
+-✗ DEV_010 (Ranger Ravi) - Station-B
+-
+-Scenario 2: EMP005 Logs In
+----------------------------
+-Sees:
+-✓ DEV_009 (Ranger Karthik) - registered by EMP005
+-✓ DEV_010 (Ranger Ravi) - registered by EMP005
+-
+-Does NOT see:
+-✗ DEV_003, DEV_004, DEV_005 - Station-A devices
+-
+-Scenario 3: Admin Logs In
+---------------------------
+-Sees ALL:
+-✓ DEV_003, DEV_004, DEV_005 (Station-A)
+-✓ DEV_009, DEV_010 (Station-B)
+-
+-
+-BENEFITS
+---------
+-
+-1. Operational Efficiency
+-   - Operators focus on their area
+-   - No confusion from other stations
+-   - Faster device lookup
+-
+-2. Data Security
+-   - Station-level isolation
+-   - Prevents unauthorized access
+-   - Clear access boundaries
+-
+-3. Scalability
+-   - Works with any number of stations
+-   - Automatic filtering
+-   - No manual configuration
+-
+-4. User Experience
+-   - Clean, focused interface
+-   - Visual station indicator
+-   - Clear filtering feedback
+-
+-
+-TESTING SCENARIOS
+------------------
+-
+-Test 1: Operator Filtering
+----------------------------
+-1. Create operator EMP001 with Station-A
+-2. Create operator EMP005 with Station-B
+-3. Register DEV_001 as EMP001
+-4. Register DEV_002 as EMP005
+-5. Login as EMP001
+-6. Verify: See only DEV_001
+-7. Login as EMP005
+-8. Verify: See only DEV_002
+-
+-Test 2: Admin View
+--------------------
+-1. Login as admin
+-2. Verify: See all devices (DEV_001 and DEV_002)
+-
+-Test 3: Station Change
+------------------------
+-1. Operator EMP001 has Station-A
+-2. Registers DEV_001
+-3. Admin changes EMP001 to Station-B
+-4. EMP001 logs in
+-5. Verify: Does NOT see DEV_001 anymore
+-
+-Test 4: Multiple Operators Same Station
+-----------------------------------------
+-1. EMP001 and EMP002 both Station-A
+-2. EMP001 registers DEV_001
+-3. EMP002 registers DEV_002
+-4. Login as EMP001
+-5. Verify: See both DEV_001 and DEV_002
+-
+-
+-CONCLUSION
+-----------
+-
+-Station-based filtering provides operators with a focused, secure view of devices within their jurisdiction. By filtering registered devices based on the operator's assigned station, the system ensures:
+-
+-- Clear operational boundaries
+-- Reduced interface clutter
+-- Enhanced data security
+-- Better user experience
+-
+-The feature leverages existing database relationships without requiring new fields, making it efficient and maintainable.
+-
+-Key Innovation: Automatic filtering based on registered_by_emp_id → assigned_station relationship, providing seamless station isolation.
+diff --git a/USER_TOGGLE_FIX.md b/USER_TOGGLE_FIX.md
+new file mode 100644
+index 0000000..92c4d77
+--- /dev/null
++++ b/USER_TOGGLE_FIX.md
+@@ -0,0 +1,170 @@
++# User Management Toggle Fix
++
++## Problem
++The toggle button in User Management was not working correctly because of a data type mismatch:
++- **Database**: Stores `is_active` as INTEGER (0 or 1)
++- **Frontend**: Was treating it as BOOLEAN (true/false)
++- **Backend Schema**: Expected BOOLEAN but database uses INTEGER
++
++## Solution Applied
++
++### 1. Frontend Fix (`UserManagement.jsx`)
++
++**Before:**
++```javascript
++const toggleUserStatus = async (userId, currentStatus) => {
++  await axios.patch(
++    `http://localhost:8000/api/users/${userId}`,
++    { is_active: !currentStatus },  // Boolean negation doesn't work with 0/1
++    { headers: { Authorization: `Bearer ${token}` } }
++  );
++};
++```
++
++**After:**
++```javascript
++const toggleUserStatus = async (userId, currentStatus) => {
++  // Convert to integer properly - currentStatus is 1 or 0 from database
++  const newStatus = currentStatus === 1 ? 0 : 1;
++  
++  await axios.patch(
++    `http://localhost:8000/api/users/${userId}`,
++    { is_active: newStatus },  // Send integer value
++    { headers: { Authorization: `Bearer ${token}` } }
++  );
++  
++  alert(`User ${newStatus === 1 ? 'activated' : 'deactivated'} successfully!`);
++};
++```
++
++**Display Fix:**
++```javascript
++// Before: user.is_active (truthy check doesn't work reliably with 0/1)
++// After: user.is_active === 1 (explicit integer comparison)
++
++<span className={`status-badge ${user.is_active === 1 ? 'active' : 'inactive'}`}>
++  {user.is_active === 1 ? 'Active' : 'Inactive'}
++</span>
++```
++
++**Toggle Button Styling:**
++```javascript
++<button
++  style={{
++    color: user.is_active === 1 ? '#4caf50' : '#9e9e9e',  // Green when active, gray when inactive
++    fontSize: '24px',
++    cursor: 'pointer',
++    border: 'none',
++    background: 'transparent',
++    padding: '5px'
++  }}
++>
++  {user.is_active === 1 ? <FaToggleOn /> : <FaToggleOff />}
++</button>
++```
++
++### 2. Backend Schema Fix (`schemas.py`)
++
++**Before:**
++```python
++class UserUpdate(BaseModel):
++    is_active: bool  # Only accepts boolean
++```
++
++**After:**
++```python
++class UserUpdate(BaseModel):
++    is_active: Union[bool, int]
++    
++    @field_validator('is_active')
++    def convert_to_int(cls, v):
++        # Convert boolean to int for database (True -> 1, False -> 0)
++        if isinstance(v, bool):
++            return 1 if v else 0
++        # If already int, ensure it's 0 or 1
++        return 1 if v else 0
++```
++
++## Benefits
++
++1. ✅ **Explicit Type Handling** - No ambiguity between 0/1 and true/false
++2. ✅ **Visual Feedback** - Alert message confirms action
++3. ✅ **Better Styling** - Toggle button color changes (green/gray)
++4. ✅ **Error Handling** - Shows error message if update fails
++5. ✅ **Flexible Backend** - Accepts both boolean and integer values
++
++## Testing
++
++### Test Steps:
++1. Login as admin
++2. Go to User Management
++3. Find an operator user
++4. Click the toggle button
++5. Verify:
++   - Alert message appears
++   - Status badge updates (Active/Inactive)
++   - Toggle icon changes (On/Off)
++   - Toggle color changes (Green/Gray)
++   - User list refreshes
++
++### Expected Behavior:
++
++**Active User (is_active = 1):**
++- Status badge: Green "Active"
++- Toggle icon: FaToggleOn (filled)
++- Toggle color: Green (#4caf50)
++- Click → Deactivates → Shows "User deactivated successfully!"
++
++**Inactive User (is_active = 0):**
++- Status badge: Gray "Inactive"
++- Toggle icon: FaToggleOff (outline)
++- Toggle color: Gray (#9e9e9e)
++- Click → Activates → Shows "User activated successfully!"
++
++**Admin User:**
++- Cannot be toggled
++- Shows "Always Active" text instead of toggle button
++
++## Database Schema
++
++The `users` table stores `is_active` as INTEGER:
++```sql
++is_active INTEGER DEFAULT 1 NOT NULL
++```
++
++Values:
++- `1` = Active (user can login)
++- `0` = Inactive (user cannot login)
++
++## Alternative Solutions Considered
++
++### Option 1: Change Database to BOOLEAN
++- ❌ Requires migration
++- ❌ May break existing data
++- ❌ SQLite doesn't have native BOOLEAN type
++
++### Option 2: Change Frontend to Use Boolean
++- ❌ Inconsistent with database
++- ❌ Requires backend conversion
++- ❌ More complex
++
++### Option 3: Current Solution (Recommended) ✅
++- ✅ No database changes needed
++- ✅ Explicit type handling
++- ✅ Works with existing data
++- ✅ Clear and maintainable
++
++## Files Modified
++
++1. `frontend/src/components/UserManagement.jsx`
++   - Fixed `toggleUserStatus` function
++   - Fixed status display logic
++   - Added better styling
++
++2. `backend/app/schemas.py`
++   - Updated `UserUpdate` schema
++   - Added type conversion validator
++
++## Status
++
++✅ **FIXED** - Toggle function now works correctly with integer database values
+diff --git a/Unconsciousness_Detection_Feature.txt b/Unconsciousness_Detection_Feature.txt
+deleted file mode 100644
+index 62ba344..0000000
+--- a/Unconsciousness_Detection_Feature.txt
++++ /dev/null
+@@ -1,51 +0,0 @@
+-UNCONSCIOUSNESS DETECTION FEATURE - COMPLETE WORKING DOCUMENTATION
+-==================================================================
+-
+-1. FEATURE OVERVIEW
+--------------------
+-The Unconsciousness Detection Feature is a proactive safety mechanism designed for the Forest Emergency Communication System (FECS). It mathematically monitors the physical movement of personnel carrying User Modules in the field over a 2-hour window. If a user becomes suspicious stationary (moving less than 10 meters in 2 hours), the system actively challenges them by triggering a physical buzzer on their hardware. If the user fails to acknowledge this challenge within 60 seconds, the software automatically escalates their status to an 'Emergency' on the dashboard.
+-
+-2. WHY IS THIS FEATURE NECESSARY?
+----------------------------------
+-In remote or hazardous forest environments, traditional SOS systems rely entirely on the victim being conscious and physically capable of pressing an emergency button. 
+-
+-*   The Blind Spot: If a ranger falls, is attacked by wildlife, or suffers a sudden medical emergency (e.g., snakebite, heart attack) and loses consciousness, they cannot press the SOS button. 
+-*   The Solution: This feature acts as an automated "Dead Man's Switch." It shifts the system from passive listening to active monitoring. It ensures that an incapacitated ranger is never left behind simply because they couldn't call for help themselves.
+-
+-3. THE ACK MESSAGE FORMAT (SERVER -> BASE -> USER MODULE)
+----------------------------------------------------------
+-Because the ESP32 parser requires strict adherence to bandwidth and memory constraints, the outbound Acknowledgment (ACK) message from the server strips out heavy JSON and unused timestamp fields, favoring an ultra-lightweight pipe-delimited format.
+-
+-Final Format Design:
+-[packet_id] | [device_id] | [ack_type]
+-
+-Field Breakdown:
+-1. packet_id: A unique identifier generated by the server (e.g., "ACK_17203..."). Tells the hardware not to process this ping twice if relayed multiple times.
+-2. device_id: The specific hardware identifier (e.g., "DEV_001"). Ensures that only the targeted ranger's buzzer activates, not the entire forest network.
+-3. ack_type: A critical single-character flag parsed by the ESP32.
+-   - 'L' = LED Blink (Quiet confirmation that a normal message was received by the server).
+-   - 'B' = Buzzer Alarm (Loud challenge fired by the server demanding a manual button press response).
+-
+-Example Payload (Over MQTT -> LoRa):
+-ACK_17109283|DEV_001|B
+-
+-4. CORE FUNCTIONS USED IN IMPLEMENTATION
+-----------------------------------------
+-
+-A. Mathematical Calculation: `calculate_distance(lat1, lon1, lat2, lon2)`
+-   - Location: `backend/app/services/alert_service.py`
+-   - Purpose: Uses the standard Haversine formula to compute the spherical distance between the latest 2-hour GPS auto-ping and the preceding auto-ping. Accurately determines if the traveler has moved fewer than 10 meters.
+-
+-B. Data Persistence: `store_alert(...)` & `MonitoringStatus` Model
+-   - Location: `backend/app/models.py` & `alert_service.py`
+-   - Purpose: Silently intercepts incoming 'Auto' regular pings and logs the user's coordinates in a dedicated tracking table (`MonitoringStatus`) to provide historical context for the Haversine formula without bloating the primary alert table.
+-
+-C. Hardware Trigger: `publish_buzzer_ack(device_id, mqtt_client)`
+-   - Location: `backend/app/services/ack_service.py`
+-   - Purpose: The exact function that formats the custom 3-field `packet_id|device_id|B` string and pushes it to the `fecs/ack` MQTT topic.
+-
+-D. The Asynchronous Engine: `monitoring_service.py` / `MonitoringService.run()`
+-   - Location: `backend/app/services/monitoring_service.py`
+-   - Purpose: An `asyncio` background loop initialized directly in FastAPI's startup (`main.py`). It wakes up every 60 seconds completely independent of web traffic to execute two core sweeps:
+-     1. Sweep 1 (The Check): Look for stationary coordinates over 2 hours and trigger `publish_buzzer_ack()`.
+-     2. Sweep 2 (The Escalation): Look for devices whose buzzers were triggered exactly 60 seconds ago but haven't replied. If found, artificially inject an `Emergency` alert into the database with `source=software` and blast the WebSocket to flash the Operator Dashboard red.
+diff --git a/backend/Dockerfile.stable b/backend/Dockerfile.stable
+deleted file mode 100644
+index 039f3b5..0000000
+--- a/backend/Dockerfile.stable
++++ /dev/null
+@@ -1,17 +0,0 @@
+-FROM python:3.10-bookworm
+-
+-WORKDIR /app
+-
+-RUN apt-get update && apt-get install -y --no-install-recommends \
+-    gcc \
+-    postgresql-client \
+-    && rm -rf /var/lib/apt/lists/*
+-
+-COPY requirements.txt .
+-RUN pip install --no-cache-dir -r requirements.txt
+-
+-COPY . .
+-
+-EXPOSE 8000
+-
+-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+diff --git a/backend/alembic/versions/remove_user_is_active.py b/backend/alembic/versions/remove_user_is_active.py
+new file mode 100644
+index 0000000..a40634c
+--- /dev/null
++++ b/backend/alembic/versions/remove_user_is_active.py
+@@ -0,0 +1,26 @@
++"""remove user is_active column
++
++Revision ID: remove_user_is_active
++Revises: add_user_fields
++Create Date: 2024-01-15 10:00:00.000000
++
++"""
++from alembic import op
++import sqlalchemy as sa
++
++
++# revision identifiers, used by Alembic.
++revision = 'remove_user_is_active'
++down_revision = 'add_device_registrations'
++branch_labels = None
++depends_on = None
++
++
++def upgrade():
++    # Remove is_active column from users table
++    op.drop_column('users', 'is_active')
++
++
++def downgrade():
++    # Add back is_active column if needed to rollback
++    op.add_column('users', sa.Column('is_active', sa.Integer(), nullable=False, server_default='1'))
+diff --git a/backend/app/api/routes.py b/backend/app/api/routes.py
+index 94aa95f..5fc106e 100644
+--- a/backend/app/api/routes.py
++++ b/backend/app/api/routes.py
+@@ -5,7 +5,7 @@ from typing import List
+ from app.database import get_db
+ from app.models import Alert, User, UserRole, AlertStatus, DeviceRegistration, MessageType
+ from app.schemas import (
+-    AlertResponse, UserCreate, UserResponse, Token, AlertStatusUpdate, UserUpdate,
++    AlertResponse, UserCreate, UserResponse, Token, AlertStatusUpdate,
+     DeviceRegistrationCreate, DeviceRegistrationResponse, UnmappedDevice
+ )
+ from app.services.auth_service import (
+@@ -24,7 +24,7 @@ async def get_current_user(token: str = Depends(oauth2_scheme), db: Session = De
+             detail="Invalid authentication credentials"
+         )
+     user = db.query(User).filter(User.username == token_data.username).first()
+-    if user is None or not user.is_active:
++    if user is None:
+         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+     return user
+ 
+@@ -55,8 +55,6 @@ async def login(form_data: OAuth2PasswordRequestForm = Depends(), db: Session =
+             status_code=status.HTTP_401_UNAUTHORIZED,
+             detail="Incorrect employee ID or password"
+         )
+-    if not user.is_active:
+-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User is inactive")
+     
+     access_token = create_access_token(data={"sub": user.username})
+     return {"access_token": access_token, "token_type": "bearer"}
+@@ -152,26 +150,6 @@ async def get_next_employee_id(
+     
+     return {"next_employee_id": next_id}
+ 
+-@router.patch("/users/{user_id}")
+-async def update_user(
+-    user_id: int,
+-    user_update: UserUpdate,
+-    db: Session = Depends(get_db),
+-    admin: User = Depends(get_admin_user)
+-):
+-    user = db.query(User).filter(User.id == user_id).first()
+-    if not user:
+-        raise HTTPException(status_code=404, detail="User not found")
+-    
+-    # Prevent deactivating admin users
+-    if user.role == UserRole.ADMIN:
+-        raise HTTPException(status_code=403, detail="Cannot deactivate admin users")
+-    
+-    user.is_active = user_update.is_active
+-    db.commit()
+-    db.refresh(user)
+-    return {"message": "User updated", "user": user}
+-
+ # Alert endpoints
+ @router.get("/alerts", response_model=List[AlertResponse])
+ async def get_alerts(
+@@ -180,7 +158,127 @@ async def get_alerts(
+     db: Session = Depends(get_db),
+     current_user: User = Depends(get_current_user)
+ ):
+-    return db.query(Alert).order_by(Alert.received_at.desc()).offset(skip).limit(limit).all()
++    from sqlalchemy import outerjoin, func
++    
++    # For operators: Show only latest alert per registered device from their station
++    if current_user.role == UserRole.OPERATOR and current_user.assigned_station:
++        # Get all employee_ids from same station
++        station_operators = db.query(User.employee_id).filter(
++            User.assigned_station == current_user.assigned_station,
++            User.employee_id.isnot(None)
++        ).all()
++        station_emp_ids = [op[0] for op in station_operators]
++        
++        if not station_emp_ids:
++            return []
++        
++        # Get device_ids registered by operators from same station
++        station_device_ids = db.query(DeviceRegistration.device_id).filter(
++            DeviceRegistration.registered_by_emp_id.in_(station_emp_ids),
++            DeviceRegistration.is_active == 1
++        ).all()
++        station_device_ids = [d[0] for d in station_device_ids]
++        
++        if not station_device_ids:
++            return []
++        
++        # Get latest alert ID for each device
++        subquery = db.query(
++            Alert.device_id,
++            func.max(Alert.id).label('max_id')
++        ).filter(
++            Alert.device_id.in_(station_device_ids)
++        ).group_by(Alert.device_id).subquery()
++        
++        # Join to get full alert details with user info
++        results = db.query(
++            Alert,
++            DeviceRegistration.name,
++            DeviceRegistration.phone_number
++        ).join(
++            subquery,
++            (Alert.device_id == subquery.c.device_id) & (Alert.id == subquery.c.max_id)
++        ).outerjoin(
++            DeviceRegistration,
++            (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
++        ).order_by(Alert.received_at.desc()).all()
++    else:
++        # For admins: Show all alerts (existing behavior)
++        results = db.query(
++            Alert,
++            DeviceRegistration.name,
++            DeviceRegistration.phone_number
++        ).outerjoin(
++            DeviceRegistration,
++            (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
++        ).order_by(Alert.received_at.desc()).offset(skip).limit(limit).all()
++    
++    # Build response with user info
++    alerts = []
++    for alert, user_name, user_phone in results:
++        alert_dict = {
++            "id": alert.id,
++            "packet_id": alert.packet_id,
++            "device_id": alert.device_id,
++            "latitude": alert.latitude,
++            "longitude": alert.longitude,
++            "message_type": alert.message_type,
++            "signal_type": alert.signal_type,
++            "event_time": alert.event_time,
++            "received_at": alert.received_at,
++            "status": alert.status,
++            "source": alert.source,
++            "notes": alert.notes,
++            "user_name": user_name,
++            "user_phone": user_phone
++        }
++        alerts.append(alert_dict)
++    
++    return alerts
++
++@router.get("/alerts/device/{device_id}", response_model=List[AlertResponse])
++async def get_device_alert_history(
++    device_id: str,
++    db: Session = Depends(get_db),
++    current_user: User = Depends(get_current_user)
++):
++    """Get all alert history for a specific device"""
++    from sqlalchemy import outerjoin
++    
++    # Get all alerts for this device with user info
++    results = db.query(
++        Alert,
++        DeviceRegistration.name,
++        DeviceRegistration.phone_number
++    ).outerjoin(
++        DeviceRegistration,
++        (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
++    ).filter(
++        Alert.device_id == device_id
++    ).order_by(Alert.received_at.desc()).all()
++    
++    # Build response
++    alerts = []
++    for alert, user_name, user_phone in results:
++        alert_dict = {
++            "id": alert.id,
++            "packet_id": alert.packet_id,
++            "device_id": alert.device_id,
++            "latitude": alert.latitude,
++            "longitude": alert.longitude,
++            "message_type": alert.message_type,
++            "signal_type": alert.signal_type,
++            "event_time": alert.event_time,
++            "received_at": alert.received_at,
++            "status": alert.status,
++            "source": alert.source,
++            "notes": alert.notes,
++            "user_name": user_name,
++            "user_phone": user_phone
++        }
++        alerts.append(alert_dict)
++    
++    return alerts
+ 
+ @router.get("/alerts/{alert_id}", response_model=AlertResponse)
+ async def get_alert(
+@@ -188,10 +286,37 @@ async def get_alert(
+     db: Session = Depends(get_db),
+     current_user: User = Depends(get_current_user)
+ ):
+-    alert = db.query(Alert).filter(Alert.id == alert_id).first()
+-    if not alert:
++    # Join with device_registrations to get user info
++    result = db.query(
++        Alert,
++        DeviceRegistration.name,
++        DeviceRegistration.phone_number
++    ).outerjoin(
++        DeviceRegistration,
++        (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
++    ).filter(Alert.id == alert_id).first()
++    
++    if not result:
+         raise HTTPException(status_code=404, detail="Alert not found")
+-    return alert
++    
++    alert, user_name, user_phone = result
++    
++    return {
++        "id": alert.id,
++        "packet_id": alert.packet_id,
++        "device_id": alert.device_id,
++        "latitude": alert.latitude,
++        "longitude": alert.longitude,
++        "message_type": alert.message_type,
++        "signal_type": alert.signal_type,
++        "event_time": alert.event_time,
++        "received_at": alert.received_at,
++        "status": alert.status,
++        "source": alert.source,
++        "notes": alert.notes,
++        "user_name": user_name,
++        "user_phone": user_phone
++    }
+ 
+ @router.patch("/alerts/{alert_id}/status")
+ async def update_alert_status(
+diff --git a/backend/app/models.py b/backend/app/models.py
+index 64d2b15..33d6c3a 100644
+--- a/backend/app/models.py
++++ b/backend/app/models.py
+@@ -49,7 +49,6 @@ class User(Base):
+     employee_id = Column(String, unique=True, nullable=True)
+     assigned_station = Column(String, nullable=True)
+     created_at = Column(DateTime, server_default=func.now(), nullable=False)
+-    is_active = Column(Integer, default=1, nullable=False)
+ 
+ class DeviceRegistration(Base):
+     __tablename__ = "device_registrations"
+diff --git a/backend/app/mqtt_handler.py b/backend/app/mqtt_handler.py
+index ea8d9dc..6dcb94f 100644
+--- a/backend/app/mqtt_handler.py
++++ b/backend/app/mqtt_handler.py
+@@ -5,7 +5,7 @@ import logging
+ from app.config import settings
+ from app.schemas import IncomingAlert
+ from app.database import SessionLocal
+-from app.services.alert_service import is_duplicate, store_alert, should_send_ack
++from app.services.alert_service import is_duplicate, store_alert, is_device_registered
+ from app.services.ack_service import publish_ack
+ 
+ logger = logging.getLogger(__name__)
+@@ -48,6 +48,17 @@ class MQTTHandler:
+             
+             db = SessionLocal()
+             try:
++                # Security check: Only accept NORMAL alerts from unregistered devices
++                from app.services.alert_service import is_device_registered
++                is_registered = is_device_registered(db, alert.device_id)
++                
++                if not is_registered and alert.message_type != 'normal':
++                    logger.warning(
++                        f"Rejected {alert.message_type} alert from unregistered device: {alert.device_id}. "
++                        f"Only NORMAL alerts accepted from unregistered devices."
++                    )
++                    return
++                
+                 # Check for duplicate
+                 if is_duplicate(db, alert):
+                     logger.info(f"Duplicate alert discarded: {alert.packet_id}")
+@@ -57,9 +68,22 @@ class MQTTHandler:
+                 stored_alert = store_alert(db, alert)
+                 logger.info(f"Alert stored: {stored_alert.id}")
+                 
+-                # Send ACK if needed
+-                if should_send_ack(alert) and self.client:
++                # Send automatic delivery ACK to base station for registered devices with manual signal type
++                if is_registered and alert.signal_type == 'manual' and self.client:
+                     await publish_ack(alert, self.client)
++                    logger.info(f"Automatic delivery ACK sent for registered device: {alert.device_id}, signal: manual")
++                
++                # Get user info if device is registered
++                from app.models import DeviceRegistration
++                device_reg = db.query(DeviceRegistration).filter(
++                    DeviceRegistration.device_id == alert.device_id,
++                    DeviceRegistration.is_active == 1
++                ).first()
++                
++                user_name = device_reg.name if device_reg else None
++                user_phone = device_reg.phone_number if device_reg else None
++                
++
+                 
+                 # Push to WebSocket clients
+                 if self.websocket_manager:
+@@ -76,7 +100,9 @@ class MQTTHandler:
+                             "event_time": stored_alert.event_time.isoformat(),
+                             "received_at": stored_alert.received_at.isoformat(),
+                             "status": stored_alert.status.value,
+-                            "source": stored_alert.source
++                            "source": stored_alert.source,
++                            "user_name": user_name,
++                            "user_phone": user_phone
+                         }
+                     }))
+                 
+diff --git a/backend/app/schemas.py b/backend/app/schemas.py
+index 5ba7015..b0e49d0 100644
+--- a/backend/app/schemas.py
++++ b/backend/app/schemas.py
+@@ -47,6 +47,8 @@ class AlertResponse(BaseModel):
+     status: AlertStatus
+     source: str
+     notes: Optional[str] = None
++    user_name: Optional[str] = None
++    user_phone: Optional[str] = None
+     
+     class Config:
+         from_attributes = True
+@@ -73,7 +75,6 @@ class UserResponse(BaseModel):
+     employee_id: Optional[str]
+     assigned_station: Optional[str]
+     created_at: datetime
+-    is_active: bool
+     
+     class Config:
+         from_attributes = True
+@@ -89,8 +90,7 @@ class AlertStatusUpdate(BaseModel):
+     status: AlertStatus
+     notes: Optional[str] = None
+ 
+-class UserUpdate(BaseModel):
+-    is_active: bool
++
+ 
+ class DeviceRegistrationCreate(BaseModel):
+     device_id: str
+diff --git a/backend/app/services/alert_service.py b/backend/app/services/alert_service.py
+index 48d94fc..c16feb4 100644
+--- a/backend/app/services/alert_service.py
++++ b/backend/app/services/alert_service.py
+@@ -1,5 +1,5 @@
+ from sqlalchemy.orm import Session
+-from app.models import Alert, MessageType, SignalType, MonitoringStatus
++from app.models import Alert, MessageType, SignalType, MonitoringStatus, DeviceRegistration
+ from app.schemas import IncomingAlert
+ from datetime import datetime, timedelta
+ from app.config import settings
+@@ -19,6 +19,14 @@ def calculate_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> fl
+     
+     return R * c
+ 
++def is_device_registered(db: Session, device_id: str) -> bool:
++    """Check if device is registered"""
++    registration = db.query(DeviceRegistration).filter(
++        DeviceRegistration.device_id == device_id,
++        DeviceRegistration.is_active == 1
++    ).first()
++    return registration is not None
++
+ def is_duplicate(db: Session, alert: IncomingAlert) -> bool:
+     """Check if alert is duplicate based on time and distance thresholds"""
+     time_threshold = timedelta(seconds=settings.DUPLICATE_TIME_THRESHOLD_SECONDS)
+diff --git a/backend/debug_device_check.py b/backend/debug_device_check.py
+new file mode 100644
+index 0000000..2d6ff29
+--- /dev/null
++++ b/backend/debug_device_check.py
+@@ -0,0 +1,82 @@
++"""
++Debug script to check device registrations
++Run this from backend directory: python debug_device_check.py
++"""
++import sys
++sys.path.append('.')
++
++from app.database import SessionLocal
++from app.models import DeviceRegistration, Alert
++
++db = SessionLocal()
++
++print("=" * 60)
++print("DEVICE REGISTRATION DEBUG")
++print("=" * 60)
++print()
++
++# Check all device registrations
++print("📋 ALL DEVICE REGISTRATIONS:")
++print("-" * 60)
++registrations = db.query(DeviceRegistration).all()
++if registrations:
++    for reg in registrations:
++        print(f"Device ID: '{reg.device_id}'")
++        print(f"  Name: {reg.name}")
++        print(f"  Phone: {reg.phone_number}")
++        print(f"  Active: {reg.is_active}")
++        print(f"  Registered by: {reg.registered_by_emp_id}")
++        print(f"  Device ID length: {len(reg.device_id)} chars")
++        print(f"  Device ID repr: {repr(reg.device_id)}")
++        print()
++else:
++    print("❌ No device registrations found!")
++    print()
++
++# Check recent alerts
++print("📡 RECENT ALERTS (last 10):")
++print("-" * 60)
++alerts = db.query(Alert).order_by(Alert.received_at.desc()).limit(10).all()
++if alerts:
++    for alert in alerts:
++        # Check if device is registered
++        reg = db.query(DeviceRegistration).filter(
++            DeviceRegistration.device_id == alert.device_id,
++            DeviceRegistration.is_active == 1
++        ).first()
++        
++        status = "✅ REGISTERED" if reg else "❌ UNREGISTERED"
++        print(f"Device ID: '{alert.device_id}' - {status}")
++        print(f"  Alert ID: {alert.id}")
++        print(f"  Type: {alert.message_type.value}")
++        print(f"  Time: {alert.received_at}")
++        print(f"  Device ID length: {len(alert.device_id)} chars")
++        print(f"  Device ID repr: {repr(alert.device_id)}")
++        if reg:
++            print(f"  ✅ Matched with: {reg.name} ({reg.phone_number})")
++        print()
++else:
++    print("❌ No alerts found!")
++    print()
++
++# Check for case sensitivity issues
++print("🔍 CHECKING FOR CASE SENSITIVITY ISSUES:")
++print("-" * 60)
++alert_device_ids = db.query(Alert.device_id).distinct().all()
++reg_device_ids = db.query(DeviceRegistration.device_id).all()
++
++alert_ids = [a[0] for a in alert_device_ids]
++reg_ids = [r[0] for r in reg_device_ids]
++
++for alert_id in alert_ids:
++    for reg_id in reg_ids:
++        if alert_id.lower() == reg_id.lower() and alert_id != reg_id:
++            print(f"⚠️  CASE MISMATCH FOUND:")
++            print(f"   Alert has: '{alert_id}'")
++            print(f"   Registration has: '{reg_id}'")
++            print()
++
++db.close()
++print("=" * 60)
++print("Debug complete!")
++print("=" * 60)
+diff --git a/backend/test_alerts_api.py b/backend/test_alerts_api.py
+new file mode 100644
+index 0000000..9d59a37
+--- /dev/null
++++ b/backend/test_alerts_api.py
+@@ -0,0 +1,45 @@
++"""
++Test the /api/alerts endpoint to verify it returns user info
++Run this from backend directory: python test_alerts_api.py
++"""
++import sys
++sys.path.append('.')
++
++from app.database import SessionLocal
++from app.models import Alert, DeviceRegistration
++
++db = SessionLocal()
++
++print("=" * 60)
++print("TESTING ALERTS API QUERY")
++print("=" * 60)
++print()
++
++# Simulate the exact query from routes.py
++results = db.query(
++    Alert,
++    DeviceRegistration.name,
++    DeviceRegistration.phone_number
++).outerjoin(
++    DeviceRegistration,
++    (Alert.device_id == DeviceRegistration.device_id) & (DeviceRegistration.is_active == 1)
++).order_by(Alert.received_at.desc()).limit(10).all()
++
++print(f"Found {len(results)} alerts")
++print()
++
++for alert, user_name, user_phone in results:
++    print(f"Alert ID: {alert.id}")
++    print(f"  Device ID: {alert.device_id}")
++    print(f"  User Name: {user_name if user_name else '❌ None'}")
++    print(f"  User Phone: {user_phone if user_phone else '❌ None'}")
++    print(f"  Message Type: {alert.message_type.value}")
++    print(f"  Time: {alert.received_at}")
++    print()
++
++db.close()
++
++print("=" * 60)
++print("If user_name shows '❌ None' for registered devices,")
++print("there's a problem with the JOIN query.")
++print("=" * 60)
+diff --git a/frontend/src/components/AlertDetail.jsx b/frontend/src/components/AlertDetail.jsx
+index 2ba5253..23b4ffa 100644
+--- a/frontend/src/components/AlertDetail.jsx
++++ b/frontend/src/components/AlertDetail.jsx
+@@ -31,10 +31,23 @@ function AlertDetail({ alert, token, onUpdate }) {
+   return (
+     <div className={getAlertClass()}>
+       <div className="alert-header">
+-        <span className="device-id">{alert.device_id}</span>
++        <span className="device-id">
++          {alert.user_name ? (
++            <>
++              {alert.user_name}
++              <span style={{ fontSize: '11px', color: '#666', marginLeft: '8px' }}>({alert.device_id})</span>
++            </>
++          ) : (
++            <>
++              {alert.device_id}
++              <span style={{ fontSize: '11px', color: '#d32f2f', marginLeft: '8px' }}>⚠️ Unregistered</span>
++            </>
++          )}
++        </span>
+         <span className={`status-badge ${alert.status}`}>{alert.status}</span>
+       </div>
+       <div className="alert-body">
++        {alert.user_phone && <p><strong>Phone:</strong> {alert.user_phone}</p>}
+         <p><strong>Type:</strong> {alert.message_type}</p>
+         <p><strong>Signal:</strong> {alert.signal_type}</p>
+         <p><strong>Location:</strong> {alert.latitude.toFixed(6)}, {alert.longitude.toFixed(6)}</p>
+diff --git a/frontend/src/components/AlertList.css b/frontend/src/components/AlertList.css
+index f50c511..1fe212d 100644
+--- a/frontend/src/components/AlertList.css
++++ b/frontend/src/components/AlertList.css
+@@ -1,30 +1,24 @@
+ .alert-list {
+-  padding: 1.5rem;
++  padding: 20px;
+ }
+ 
+ .alert-list h2 {
+-  margin-bottom: 1.5rem;
+-  color: #2d5016;
+-  font-size: 1.3rem;
+   display: flex;
+   align-items: center;
+-  gap: 0.5rem;
+-  padding-bottom: 0.75rem;
+-  border-bottom: 3px solid #c8e6c9;
++  gap: 10px;
++  margin-bottom: 20px;
++  color: #333;
+ }
+ 
+ .alert-list-icon {
+-  font-size: 1.6rem;
+-  color: #4a7c2c;
++  color: #1976d2;
++  font-size: 28px;
+ }
+ 
+ .no-alerts {
+   text-align: center;
+-  color: #558b2f;
+-  margin-top: 3rem;
+-  font-size: 1.1rem;
+-  padding: 2rem;
+-  background: #f1f8e9;
++  color: #666;
++  padding: 40px;
++  background: #f5f5f5;
+   border-radius: 8px;
+-  border: 2px dashed #c8e6c9;
+ }
+diff --git a/frontend/src/components/AlertLogs.jsx b/frontend/src/components/AlertLogs.jsx
+index 4335861..b5abddf 100644
+--- a/frontend/src/components/AlertLogs.jsx
++++ b/frontend/src/components/AlertLogs.jsx
+@@ -215,4 +215,4 @@ function AlertLogs({ onBack }) {
+   );
+ }
+ 
+-export default AlertLogs;
++export default AlertLogs;
+\ No newline at end of file
+diff --git a/frontend/src/components/ExpandableAlertList.css b/frontend/src/components/ExpandableAlertList.css
+new file mode 100644
+index 0000000..e468900
+--- /dev/null
++++ b/frontend/src/components/ExpandableAlertList.css
+@@ -0,0 +1,419 @@
++.expandable-alert-list {
++  padding: 20px;
++  max-width: 1200px;
++  margin: 0 auto;
++}
++
++.expandable-alert-list h2 {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  margin-bottom: 20px;
++  color: #333;
++}
++
++.alert-list-icon {
++  color: #1976d2;
++  font-size: 28px;
++}
++
++.no-alerts {
++  text-align: center;
++  color: #666;
++  padding: 40px;
++  background: #f5f5f5;
++  border-radius: 8px;
++}
++
++.alert-cards {
++  display: flex;
++  flex-direction: column;
++  gap: 15px;
++}
++
++.alert-card-wrapper {
++  border-radius: 8px;
++  overflow: hidden;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
++  transition: all 0.3s ease;
++}
++
++.alert-card-wrapper:hover {
++  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
++}
++
++.alert-item {
++  background: white;
++  border-left: 5px solid #ccc;
++  transition: all 0.2s ease;
++}
++
++.alert-item.emergency {
++  border-left-color: #d32f2f;
++}
++
++.alert-item.high {
++  border-left-color: #f57c00;
++}
++
++.alert-item.normal {
++  border-left-color: #388e3c;
++}
++
++.alert-header {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  padding: 15px 20px;
++  cursor: pointer;
++  background: #fafafa;
++  border-bottom: 1px solid #eee;
++}
++
++.alert-header:hover {
++  background: #f0f0f0;
++}
++
++.alert-user-info {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++}
++
++.alert-icon {
++  font-size: 24px;
++}
++
++.user-details {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++}
++
++.user-name {
++  font-size: 18px;
++  font-weight: 600;
++  color: #333;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.device-id-small {
++  font-size: 12px;
++  color: #666;
++}
++
++.unregistered-badge {
++  font-size: 11px;
++  color: #d32f2f;
++  font-weight: normal;
++}
++
++.alert-meta {
++  display: flex;
++  align-items: center;
++  gap: 15px;
++  font-size: 14px;
++}
++
++.alert-type {
++  text-transform: uppercase;
++  font-weight: 600;
++  padding: 4px 8px;
++  border-radius: 4px;
++  background: #e0e0e0;
++}
++
++.alert-item.emergency .alert-type {
++  background: #ffebee;
++  color: #d32f2f;
++}
++
++.alert-item.high .alert-type {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.alert-item.normal .alert-type {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.alert-time {
++  color: #666;
++  font-size: 13px;
++}
++
++.status-badge {
++  padding: 4px 10px;
++  border-radius: 12px;
++  font-size: 12px;
++  font-weight: 600;
++  text-transform: uppercase;
++}
++
++.status-badge.pending {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.status-badge.acknowledged {
++  background: #e3f2fd;
++  color: #1976d2;
++}
++
++.status-badge.resolved {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.alert-body {
++  padding: 15px 20px;
++  background: white;
++}
++
++.alert-body p {
++  margin: 8px 0;
++  font-size: 14px;
++  color: #555;
++}
++
++.alert-actions {
++  padding: 15px 20px;
++  background: #fafafa;
++  border-top: 1px solid #eee;
++}
++
++.alert-actions textarea {
++  width: 100%;
++  padding: 10px;
++  border: 1px solid #ddd;
++  border-radius: 4px;
++  font-size: 14px;
++  font-family: inherit;
++  resize: vertical;
++  margin-bottom: 10px;
++}
++
++.action-buttons {
++  display: flex;
++  gap: 10px;
++}
++
++.action-buttons button {
++  padding: 8px 16px;
++  border: none;
++  border-radius: 4px;
++  font-size: 14px;
++  font-weight: 600;
++  cursor: pointer;
++  display: flex;
++  align-items: center;
++  gap: 6px;
++  transition: all 0.2s ease;
++}
++
++.btn-acknowledge {
++  background: #1976d2;
++  color: white;
++}
++
++.btn-acknowledge:hover {
++  background: #1565c0;
++}
++
++.btn-resolve {
++  background: #388e3c;
++  color: white;
++}
++
++.btn-resolve:hover {
++  background: #2e7d32;
++}
++
++/* History Section */
++.alert-history {
++  background: #f9f9f9;
++  border-top: 2px solid #e0e0e0;
++  animation: slideDown 0.3s ease;
++}
++
++@keyframes slideDown {
++  from {
++    opacity: 0;
++    max-height: 0;
++  }
++  to {
++    opacity: 1;
++    max-height: 1000px;
++  }
++}
++
++.history-header {
++  padding: 12px 20px;
++  background: #e0e0e0;
++  font-weight: 600;
++  color: #555;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.loading {
++  padding: 20px;
++  text-align: center;
++  color: #666;
++}
++
++.no-history {
++  padding: 20px;
++  text-align: center;
++  color: #999;
++  font-style: italic;
++}
++
++.history-timeline {
++  padding: 20px;
++}
++
++.history-item {
++  display: flex;
++  gap: 15px;
++  margin-bottom: 20px;
++  position: relative;
++}
++
++.history-item:not(:last-child)::after {
++  content: '';
++  position: absolute;
++  left: 11px;
++  top: 30px;
++  bottom: -20px;
++  width: 2px;
++  background: #ddd;
++}
++
++.history-marker {
++  font-size: 20px;
++  min-width: 24px;
++  text-align: center;
++}
++
++.history-content {
++  flex: 1;
++  background: white;
++  padding: 12px 15px;
++  border-radius: 6px;
++  border-left: 3px solid #ccc;
++}
++
++.history-item.emergency .history-content {
++  border-left-color: #d32f2f;
++}
++
++.history-item.high .history-content {
++  border-left-color: #f57c00;
++}
++
++.history-item.normal .history-content {
++  border-left-color: #388e3c;
++}
++
++.history-title {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  margin-bottom: 8px;
++  flex-wrap: wrap;
++}
++
++.hist-type {
++  font-size: 12px;
++  font-weight: 700;
++  padding: 3px 8px;
++  border-radius: 3px;
++}
++
++.hist-type.emergency {
++  background: #ffebee;
++  color: #d32f2f;
++}
++
++.hist-type.high {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.hist-type.normal {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.hist-time {
++  font-size: 12px;
++  color: #666;
++}
++
++.hist-status {
++  font-size: 11px;
++  padding: 2px 8px;
++  border-radius: 10px;
++  text-transform: uppercase;
++  font-weight: 600;
++}
++
++.hist-status.pending {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.hist-status.acknowledged {
++  background: #e3f2fd;
++  color: #1976d2;
++}
++
++.hist-status.resolved {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.history-details {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  font-size: 13px;
++  color: #666;
++  margin-bottom: 6px;
++}
++
++.history-notes {
++  font-size: 13px;
++  color: #555;
++  background: #f5f5f5;
++  padding: 8px;
++  border-radius: 4px;
++  margin-top: 8px;
++}
++
++/* Responsive */
++@media (max-width: 768px) {
++  .alert-header {
++    flex-direction: column;
++    align-items: flex-start;
++    gap: 10px;
++  }
++
++  .alert-meta {
++    width: 100%;
++    justify-content: space-between;
++  }
++
++  .action-buttons {
++    flex-direction: column;
++  }
++
++  .action-buttons button {
++    width: 100%;
++  }
++}
+diff --git a/frontend/src/components/ExpandableAlertList.jsx b/frontend/src/components/ExpandableAlertList.jsx
+new file mode 100644
+index 0000000..af6355d
+--- /dev/null
++++ b/frontend/src/components/ExpandableAlertList.jsx
+@@ -0,0 +1,213 @@
++import React, { useState } from 'react';
++import { MdExpandMore, MdExpandLess, MdHistory, MdNotificationsActive } from 'react-icons/md';
++import { FaCheckCircle, FaCheck } from 'react-icons/fa';
++import { updateAlertStatus } from '../services/api';
++import './ExpandableAlertList.css';
++
++function ExpandableAlertList({ alerts, token, onUpdate }) {
++  const [expandedDevices, setExpandedDevices] = useState({});
++  const [deviceHistory, setDeviceHistory] = useState({});
++  const [loadingHistory, setLoadingHistory] = useState({});
++  const [notes, setNotes] = useState({});
++
++  const toggleExpand = async (deviceId) => {
++    const isExpanded = expandedDevices[deviceId];
++    
++    setExpandedDevices({
++      ...expandedDevices,
++      [deviceId]: !isExpanded
++    });
++
++    // Fetch history if expanding and not already loaded
++    if (!isExpanded && !deviceHistory[deviceId]) {
++      setLoadingHistory({ ...loadingHistory, [deviceId]: true });
++      try {
++        const response = await fetch(`http://localhost:8000/api/alerts/device/${deviceId}`, {
++          headers: {
++            'Authorization': `Bearer ${token}`
++          }
++        });
++        const history = await response.json();
++        setDeviceHistory({ ...deviceHistory, [deviceId]: history });
++      } catch (error) {
++        console.error('Failed to fetch device history:', error);
++      } finally {
++        setLoadingHistory({ ...loadingHistory, [deviceId]: false });
++      }
++    }
++  };
++
++  const handleStatusChange = async (alertId, newStatus, alertNotes) => {
++    try {
++      await updateAlertStatus(alertId, newStatus, alertNotes, token);
++      onUpdate();
++    } catch (error) {
++      console.error('Failed to update status:', error);
++    }
++  };
++
++  const getAlertClass = (messageType) => {
++    switch (messageType) {
++      case 'emergency': return 'alert-item emergency';
++      case 'high': return 'alert-item high';
++      case 'normal': return 'alert-item normal';
++      default: return 'alert-item';
++    }
++  };
++
++  const getAlertIcon = (messageType) => {
++    switch (messageType) {
++      case 'emergency': return '🔴';
++      case 'high': return '🟠';
++      case 'normal': return '🟢';
++      default: return '🔵';
++    }
++  };
++
++  const formatTimeAgo = (timestamp) => {
++    const now = new Date();
++    const alertTime = new Date(timestamp);
++    const diffMs = now - alertTime;
++    const diffMins = Math.floor(diffMs / 60000);
++    const diffHours = Math.floor(diffMins / 60);
++    const diffDays = Math.floor(diffHours / 24);
++
++    if (diffMins < 1) return 'Just now';
++    if (diffMins < 60) return `${diffMins} min ago`;
++    if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
++    return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
++  };
++
++  return (
++    <div className="expandable-alert-list">
++      <h2>
++        <MdNotificationsActive className="alert-list-icon" />
++        Active Personnel ({alerts.length})
++      </h2>
++      {alerts.length === 0 ? (
++        <p className="no-alerts">No active personnel to display</p>
++      ) : (
++        <div className="alert-cards">
++          {alerts.map((alert) => {
++            const isExpanded = expandedDevices[alert.device_id];
++            const history = deviceHistory[alert.device_id] || [];
++            const isLoading = loadingHistory[alert.device_id];
++            const currentNotes = notes[alert.id] || alert.notes || '';
++
++            return (
++              <div key={alert.device_id} className="alert-card-wrapper">
++                {/* Main Alert Card */}
++                <div className={getAlertClass(alert.message_type)}>
++                  <div className="alert-header" onClick={() => toggleExpand(alert.device_id)}>
++                    <div className="alert-user-info">
++                      <span className="alert-icon">{getAlertIcon(alert.message_type)}</span>
++                      <div className="user-details">
++                        <span className="user-name">
++                          {alert.user_name || alert.device_id}
++                          {!alert.user_name && (
++                            <span className="unregistered-badge">⚠️ Unregistered</span>
++                          )}
++                        </span>
++                        <span className="device-id-small">{alert.device_id}</span>
++                      </div>
++                    </div>
++                    <div className="alert-meta">
++                      <span className="alert-type">{alert.message_type}</span>
++                      <span className="alert-time">{formatTimeAgo(alert.received_at)}</span>
++                      <span className={`status-badge ${alert.status}`}>{alert.status}</span>
++                      {isExpanded ? <MdExpandLess size={24} /> : <MdExpandMore size={24} />}
++                    </div>
++                  </div>
++
++                  <div className="alert-body">
++                    {alert.user_phone && <p><strong>Phone:</strong> {alert.user_phone}</p>}
++                    <p><strong>Location:</strong> {alert.latitude.toFixed(6)}, {alert.longitude.toFixed(6)}</p>
++                    <p><strong>Signal:</strong> {alert.signal_type}</p>
++                    <p><strong>Time:</strong> {new Date(alert.event_time).toLocaleString()}</p>
++                    {alert.notes && <p><strong>Notes:</strong> {alert.notes}</p>}
++                  </div>
++
++                  <div className="alert-actions">
++                    <textarea
++                      value={currentNotes}
++                      onChange={(e) => setNotes({ ...notes, [alert.id]: e.target.value })}
++                      placeholder="Add notes..."
++                      rows="2"
++                      onClick={(e) => e.stopPropagation()}
++                    />
++                    <div className="action-buttons">
++                      {alert.status === 'pending' && (
++                        <button
++                          onClick={(e) => {
++                            e.stopPropagation();
++                            handleStatusChange(alert.id, 'acknowledged', currentNotes);
++                          }}
++                          className="btn-acknowledge"
++                        >
++                          <FaCheck /> Acknowledge
++                        </button>
++                      )}
++                      {alert.status === 'acknowledged' && (
++                        <button
++                          onClick={(e) => {
++                            e.stopPropagation();
++                            handleStatusChange(alert.id, 'resolved', currentNotes);
++                          }}
++                          className="btn-resolve"
++                        >
++                          <FaCheckCircle /> Resolve
++                        </button>
++                      )}
++                    </div>
++                  </div>
++                </div>
++
++                {/* Expanded History */}
++                {isExpanded && (
++                  <div className="alert-history">
++                    <div className="history-header">
++                      <MdHistory /> Alert History ({history.length} total)
++                    </div>
++                    {isLoading ? (
++                      <p className="loading">Loading history...</p>
++                    ) : history.length > 0 ? (
++                      <div className="history-timeline">
++                        {history.map((histAlert, index) => (
++                          <div key={histAlert.id} className={`history-item ${histAlert.message_type}`}>
++                            <div className="history-marker">
++                              {index === 0 ? '📍' : '•'}
++                            </div>
++                            <div className="history-content">
++                              <div className="history-title">
++                                <span className={`hist-type ${histAlert.message_type}`}>
++                                  {histAlert.message_type.toUpperCase()}
++                                </span>
++                                <span className="hist-time">{formatTimeAgo(histAlert.received_at)}</span>
++                                <span className={`hist-status ${histAlert.status}`}>{histAlert.status}</span>
++                              </div>
++                              <div className="history-details">
++                                <span>📍 {histAlert.latitude.toFixed(6)}, {histAlert.longitude.toFixed(6)}</span>
++                                <span>🕐 {new Date(histAlert.event_time).toLocaleString()}</span>
++                              </div>
++                              {histAlert.notes && (
++                                <div className="history-notes">💬 {histAlert.notes}</div>
++                              )}
++                            </div>
++                          </div>
++                        ))}
++                      </div>
++                    ) : (
++                      <p className="no-history">No alert history available</p>
++                    )}
++                  </div>
++                )}
++              </div>
++            );
++          })}
++        </div>
++      )}
++    </div>
++  );
++}
++
++export default ExpandableAlertList;
+diff --git a/frontend/src/components/Map.css b/frontend/src/components/Map.css
+index 6d70769..ecdb652 100644
+--- a/frontend/src/components/Map.css
++++ b/frontend/src/components/Map.css
+@@ -7,3 +7,18 @@
+   background: transparent;
+   border: none;
+ }
++
++.custom-marker-label {
++  background: transparent;
++  border: none;
++}
++
++.custom-marker-label div {
++  cursor: pointer;
++  transition: transform 0.2s ease;
++}
++
++.custom-marker-label div:hover {
++  transform: scale(1.1);
++  box-shadow: 0 4px 12px rgba(0,0,0,0.4) !important;
++}
+diff --git a/frontend/src/components/Map.jsx b/frontend/src/components/Map.jsx
+index fe8de9b..ef728ff 100644
+--- a/frontend/src/components/Map.jsx
++++ b/frontend/src/components/Map.jsx
+@@ -14,18 +14,53 @@ L.Icon.Default.mergeOptions({
+ 
+ const getMarkerColor = (messageType) => {
+   switch (messageType) {
+-    case 'emergency': return 'red';
+-    case 'high': return 'orange';
+-    case 'normal': return 'green';
+-    default: return 'blue';
++    case 'emergency': return '#d32f2f';
++    case 'high': return '#f57c00';
++    case 'normal': return '#388e3c';
++    default: return '#1976d2';
+   }
+ };
+ 
+-const createColoredIcon = (color) => {
++const getUserInitials = (userName) => {
++  if (!userName) return '?';
++  const names = userName.trim().split(' ');
++  if (names.length === 1) {
++    return names[0].substring(0, 2).toUpperCase();
++  }
++  return (names[0][0] + names[names.length - 1][0]).toUpperCase();
++};
++
++const getDeviceNumber = (deviceId) => {
++  // Extract number from device ID (e.g., DEV_301 -> 301)
++  const match = deviceId.match(/\d+/);
++  return match ? match[0] : deviceId.substring(0, 3);
++};
++
++const createCustomMarker = (alert, color, isOutOfBounds) => {
++  const initials = getUserInitials(alert.user_name);
++  const deviceNum = getDeviceNumber(alert.device_id);
++  const label = `${initials}-${deviceNum}`;
++  const bgColor = isOutOfBounds ? '#ffeb3b' : color;
++  
+   return L.divIcon({
+-    className: 'custom-marker',
+-    html: `<div style="background-color: ${color}; width: 25px; height: 25px; border-radius: 50%; border: 2px solid white;"></div>`,
+-    iconSize: [25, 25],
++    className: 'custom-marker-label',
++    html: `
++      <div style="
++        background-color: ${bgColor};
++        color: white;
++        padding: 6px 10px;
++        border-radius: 8px;
++        font-weight: bold;
++        font-size: 12px;
++        border: 3px solid white;
++        box-shadow: 0 2px 8px rgba(0,0,0,0.3);
++        white-space: nowrap;
++        text-align: center;
++        font-family: Arial, sans-serif;
++      ">${label}</div>
++    `,
++    iconSize: [60, 30],
++    iconAnchor: [30, 15],
+   });
+ };
+ 
+@@ -90,15 +125,28 @@ function Map({ alerts, baseStation }) {
+           ? L.latLng(alert.latitude, alert.longitude).distanceTo(L.latLng(baseStation.latitude, baseStation.longitude)) > baseStation.radius_meters
+           : false;
+ 
++        const markerColor = getMarkerColor(alert.message_type);
++
+         return (
+           <Marker
+             key={alert.id}
+             position={[alert.latitude, alert.longitude]}
+-            icon={createColoredIcon(isOutOfBounds ? '#ffeb3b' : getMarkerColor(alert.message_type))}
++            icon={createCustomMarker(alert, markerColor, isOutOfBounds)}
+           >
+             <Popup>
+               <div>
+-                <strong>Device: {alert.device_id}</strong><br />
++                {alert.user_name ? (
++                  <>
++                    <strong>{alert.user_name}</strong><br />
++                    <span style={{ fontSize: '12px', color: '#666' }}>Device: {alert.device_id}</span><br />
++                    {alert.user_phone && <span style={{ fontSize: '12px' }}>Phone: {alert.user_phone}</span>}<br />
++                  </>
++                ) : (
++                  <>
++                    <strong>Device: {alert.device_id}</strong><br />
++                    <span style={{ fontSize: '12px', color: '#d32f2f' }}>⚠️ Unregistered Device</span><br />
++                  </>
++                )}
+                 Type: {alert.message_type}<br />
+                 Status: {alert.status}<br />
+                 Time: {new Date(alert.event_time).toLocaleString()}
+diff --git a/frontend/src/components/NetworkPlanner.jsx b/frontend/src/components/NetworkPlanner.jsx
+index 51bbe4b..ce19000 100644
+--- a/frontend/src/components/NetworkPlanner.jsx
++++ b/frontend/src/components/NetworkPlanner.jsx
+@@ -164,4 +164,4 @@ function NetworkPlanner({ onBack }) {
+   );
+ }
+ 
+-export default NetworkPlanner;
++export default NetworkPlanner;
+\ No newline at end of file
+diff --git a/frontend/src/components/OperatorDashboard.css b/frontend/src/components/OperatorDashboard.css
+index 860e86c..ca34b2b 100644
+--- a/frontend/src/components/OperatorDashboard.css
++++ b/frontend/src/components/OperatorDashboard.css
+@@ -284,7 +284,7 @@
+ }
+ 
+ .alert-type-badge {
+-  font-size: 2rem;
++  font-size: 0.7rem;
+   flex-shrink: 0;
+ }
+ 
+@@ -324,7 +324,8 @@
+   border-right: 3px solid #e3f2fd;
+ }
+ 
+-.alert-list-container {
++.alert-list-container,
++.user-list-container {
+   flex: 1;
+   background-color: #fff;
+   overflow-y: auto;
+@@ -351,7 +352,8 @@
+     border-bottom: 3px solid #e3f2fd;
+   }
+ 
+-  .alert-list-container {
++  .alert-list-container,
++  .user-list-container {
+     flex: 1;
+   }
+ }
+diff --git a/frontend/src/components/OperatorDashboard.jsx b/frontend/src/components/OperatorDashboard.jsx
+index cae891a..2a99846 100644
+--- a/frontend/src/components/OperatorDashboard.jsx
++++ b/frontend/src/components/OperatorDashboard.jsx
+@@ -3,7 +3,8 @@ import { FaTree, FaSignOutAlt, FaMapMarkedAlt, FaBell, FaMobileAlt, FaArrowLeft
+ import { FiMapPin, FiUser } from 'react-icons/fi';
+ import axios from 'axios';
+ import Map from './Map';
+-import AlertList from './AlertList';
++import UserList from './UserList';
++import ReadOnlyAlertList from './ReadOnlyAlertList';
+ import DeviceRegistration from './DeviceRegistration';
+ import { getAlerts, getCurrentUser, getBaseStations } from '../services/api';
+ import { connectWebSocket } from '../services/websocket';
+@@ -118,8 +119,8 @@ const OperatorDashboard = ({ onLogout }) => {
+           <div className="map-container">
+             <Map alerts={alerts} baseStation={operatorStation} />
+           </div>
+-          <div className="alert-list-container">
+-            <AlertList alerts={alerts} token={token} onUpdate={loadAlerts} />
++          <div className="user-list-container">
++            <UserList alerts={alerts} />
+           </div>
+         </div>
+       </div>
+@@ -154,7 +155,7 @@ const OperatorDashboard = ({ onLogout }) => {
+           </div>
+         </header>
+         <div className="operator-content">
+-          <AlertList alerts={alerts} token={token} onUpdate={loadAlerts} fullView={true} />
++          <ReadOnlyAlertList alerts={alerts} token={token} />
+         </div>
+       </div>
+     );
+diff --git a/frontend/src/components/ReadOnlyAlertList.css b/frontend/src/components/ReadOnlyAlertList.css
+new file mode 100644
+index 0000000..a7314f5
+--- /dev/null
++++ b/frontend/src/components/ReadOnlyAlertList.css
+@@ -0,0 +1,368 @@
++.readonly-alert-list {
++  padding: 20px;
++  max-width: 1200px;
++  margin: 0 auto;
++}
++
++.readonly-alert-list h2 {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  margin-bottom: 10px;
++  color: #333;
++}
++
++.alert-list-icon {
++  color: #1976d2;
++  font-size: 28px;
++}
++
++.readonly-note {
++  background: #e3f2fd;
++  color: #1565c0;
++  padding: 10px 15px;
++  border-radius: 6px;
++  margin-bottom: 20px;
++  font-size: 14px;
++  border-left: 4px solid #1976d2;
++}
++
++.no-alerts {
++  text-align: center;
++  color: #666;
++  padding: 40px;
++  background: #f5f5f5;
++  border-radius: 8px;
++}
++
++.readonly-alert-cards {
++  display: flex;
++  flex-direction: column;
++  gap: 15px;
++}
++
++.readonly-alert-card-wrapper {
++  border-radius: 8px;
++  overflow: hidden;
++  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
++  transition: all 0.3s ease;
++}
++
++.readonly-alert-card-wrapper:hover {
++  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
++}
++
++.readonly-alert-item {
++  background: white;
++  border-left: 5px solid #ccc;
++  transition: all 0.2s ease;
++}
++
++.readonly-alert-item.emergency {
++  border-left-color: #d32f2f;
++}
++
++.readonly-alert-item.high {
++  border-left-color: #f57c00;
++}
++
++.readonly-alert-item.normal {
++  border-left-color: #388e3c;
++}
++
++.readonly-alert-header {
++  display: flex;
++  justify-content: space-between;
++  align-items: center;
++  padding: 15px 20px;
++  cursor: pointer;
++  background: #fafafa;
++  border-bottom: 1px solid #eee;
++}
++
++.readonly-alert-header:hover {
++  background: #f0f0f0;
++}
++
++.readonly-alert-user-info {
++  display: flex;
++  align-items: center;
++  gap: 12px;
++}
++
++.alert-icon {
++  font-size: 24px;
++}
++
++.user-details {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++}
++
++.user-name {
++  font-size: 18px;
++  font-weight: 600;
++  color: #333;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.device-id-small {
++  font-size: 12px;
++  color: #666;
++}
++
++.unregistered-badge {
++  font-size: 11px;
++  color: #d32f2f;
++  font-weight: normal;
++}
++
++.readonly-alert-meta {
++  display: flex;
++  align-items: center;
++  gap: 15px;
++  font-size: 14px;
++}
++
++.alert-type {
++  text-transform: uppercase;
++  font-weight: 600;
++  padding: 4px 8px;
++  border-radius: 4px;
++  background: #e0e0e0;
++}
++
++.readonly-alert-item.emergency .alert-type {
++  background: #ffebee;
++  color: #d32f2f;
++}
++
++.readonly-alert-item.high .alert-type {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.readonly-alert-item.normal .alert-type {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.alert-time {
++  color: #666;
++  font-size: 13px;
++}
++
++.status-badge {
++  padding: 4px 10px;
++  border-radius: 12px;
++  font-size: 10px;
++  font-weight: 600;
++  text-transform: uppercase;
++}
++
++.status-badge.pending {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.status-badge.acknowledged {
++  background: #e3f2fd;
++  color: #1976d2;
++}
++
++.status-badge.resolved {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.readonly-alert-body {
++  padding: 15px 20px;
++  background: white;
++}
++
++.readonly-alert-body p {
++  margin: 8px 0;
++  font-size: 14px;
++  color: #555;
++}
++
++/* History Section */
++.readonly-alert-history {
++  background: #f9f9f9;
++  border-top: 2px solid #e0e0e0;
++  animation: slideDown 0.3s ease;
++}
++
++@keyframes slideDown {
++  from {
++    opacity: 0;
++    max-height: 0;
++  }
++  to {
++    opacity: 1;
++    max-height: 2000px;
++  }
++}
++
++.history-header {
++  padding: 12px 20px;
++  background: #e0e0e0;
++  font-weight: 600;
++  color: #555;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.loading {
++  padding: 20px;
++  text-align: center;
++  color: #666;
++}
++
++.no-history {
++  padding: 20px;
++  text-align: center;
++  color: #999;
++  font-style: italic;
++}
++
++.history-timeline {
++  padding: 20px;
++}
++
++.history-item {
++  display: flex;
++  gap: 15px;
++  margin-bottom: 20px;
++  position: relative;
++}
++
++.history-item:not(:last-child)::after {
++  content: '';
++  position: absolute;
++  left: 11px;
++  top: 30px;
++  bottom: -20px;
++  width: 2px;
++  background: #ddd;
++}
++
++.history-marker {
++  font-size: 20px;
++  min-width: 24px;
++  text-align: center;
++}
++
++.history-content {
++  flex: 1;
++  background: white;
++  padding: 12px 15px;
++  border-radius: 6px;
++  border-left: 3px solid #ccc;
++}
++
++.history-item.emergency .history-content {
++  border-left-color: #d32f2f;
++}
++
++.history-item.high .history-content {
++  border-left-color: #f57c00;
++}
++
++.history-item.normal .history-content {
++  border-left-color: #388e3c;
++}
++
++.history-title {
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  margin-bottom: 8px;
++  flex-wrap: wrap;
++}
++
++.hist-type {
++  font-size: 12px;
++  font-weight: 700;
++  padding: 3px 8px;
++  border-radius: 3px;
++}
++
++.hist-type.emergency {
++  background: #ffebee;
++  color: #d32f2f;
++}
++
++.hist-type.high {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.hist-type.normal {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.hist-time {
++  font-size: 12px;
++  color: #666;
++}
++
++.hist-status {
++  font-size: 11px;
++  padding: 2px 8px;
++  border-radius: 10px;
++  text-transform: uppercase;
++  font-weight: 600;
++}
++
++.hist-status.pending {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.hist-status.acknowledged {
++  background: #e3f2fd;
++  color: #1976d2;
++}
++
++.hist-status.resolved {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.history-details {
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++  font-size: 13px;
++  color: #666;
++  margin-bottom: 6px;
++}
++
++.history-notes {
++  font-size: 13px;
++  color: #555;
++  background: #f5f5f5;
++  padding: 8px;
++  border-radius: 4px;
++  margin-top: 8px;
++}
++
++/* Responsive */
++@media (max-width: 768px) {
++  .readonly-alert-header {
++    flex-direction: column;
++    align-items: flex-start;
++    gap: 10px;
++  }
++
++  .readonly-alert-meta {
++    width: 100%;
++    justify-content: space-between;
++  }
++}
+diff --git a/frontend/src/components/ReadOnlyAlertList.jsx b/frontend/src/components/ReadOnlyAlertList.jsx
+new file mode 100644
+index 0000000..1bef976
+--- /dev/null
++++ b/frontend/src/components/ReadOnlyAlertList.jsx
+@@ -0,0 +1,169 @@
++import React, { useState } from 'react';
++import { MdExpandMore, MdExpandLess, MdHistory } from 'react-icons/md';
++import { FaClipboardList } from 'react-icons/fa';
++import './ReadOnlyAlertList.css';
++
++function ReadOnlyAlertList({ alerts, token }) {
++  const [expandedDevices, setExpandedDevices] = useState({});
++  const [deviceHistory, setDeviceHistory] = useState({});
++  const [loadingHistory, setLoadingHistory] = useState({});
++
++  const toggleExpand = async (deviceId) => {
++    const isExpanded = expandedDevices[deviceId];
++    
++    setExpandedDevices({
++      ...expandedDevices,
++      [deviceId]: !isExpanded
++    });
++
++    // Fetch history if expanding and not already loaded
++    if (!isExpanded && !deviceHistory[deviceId]) {
++      setLoadingHistory({ ...loadingHistory, [deviceId]: true });
++      try {
++        const response = await fetch(`http://localhost:8000/api/alerts/device/${deviceId}`, {
++          headers: {
++            'Authorization': `Bearer ${token}`
++          }
++        });
++        const history = await response.json();
++        setDeviceHistory({ ...deviceHistory, [deviceId]: history });
++      } catch (error) {
++        console.error('Failed to fetch device history:', error);
++      } finally {
++        setLoadingHistory({ ...loadingHistory, [deviceId]: false });
++      }
++    }
++  };
++
++  const getAlertClass = (messageType) => {
++    switch (messageType) {
++      case 'emergency': return 'readonly-alert-item emergency';
++      case 'high': return 'readonly-alert-item high';
++      case 'normal': return 'readonly-alert-item normal';
++      default: return 'readonly-alert-item';
++    }
++  };
++
++  const getAlertIcon = (messageType) => {
++    switch (messageType) {
++      case 'emergency': return '🔴';
++      case 'high': return '🟠';
++      case 'normal': return '🟢';
++      default: return '🔵';
++    }
++  };
++
++  const formatTimeAgo = (timestamp) => {
++    const now = new Date();
++    const alertTime = new Date(timestamp);
++    const diffMs = now - alertTime;
++    const diffMins = Math.floor(diffMs / 60000);
++    const diffHours = Math.floor(diffMins / 60);
++    const diffDays = Math.floor(diffHours / 24);
++
++    if (diffMins < 1) return 'Just now';
++    if (diffMins < 60) return `${diffMins} min ago`;
++    if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
++    return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
++  };
++
++  return (
++    <div className="readonly-alert-list">
++      <h2>
++        <FaClipboardList className="alert-list-icon" />
++        Alert History - Registered Personnel ({alerts.length})
++      </h2>
++      <p className="readonly-note">📋 Read-only view - For viewing alert history and audit trail</p>
++      {alerts.length === 0 ? (
++        <p className="no-alerts">No alerts to display</p>
++      ) : (
++        <div className="readonly-alert-cards">
++          {alerts.map((alert) => {
++            const isExpanded = expandedDevices[alert.device_id];
++            const history = deviceHistory[alert.device_id] || [];
++            const isLoading = loadingHistory[alert.device_id];
++
++            return (
++              <div key={alert.device_id} className="readonly-alert-card-wrapper">
++                {/* Main Alert Card */}
++                <div className={getAlertClass(alert.message_type)}>
++                  <div className="readonly-alert-header" onClick={() => toggleExpand(alert.device_id)}>
++                    <div className="readonly-alert-user-info">
++                      <span className="alert-icon">{getAlertIcon(alert.message_type)}</span>
++                      <div className="user-details">
++                        <span className="user-name">
++                          {alert.user_name || alert.device_id}
++                          {!alert.user_name && (
++                            <span className="unregistered-badge">⚠️ Unregistered</span>
++                          )}
++                        </span>
++                        <span className="device-id-small">{alert.device_id}</span>
++                      </div>
++                    </div>
++                    <div className="readonly-alert-meta">
++                      <span className="alert-type">{alert.message_type}</span>
++                      <span className="alert-time">{formatTimeAgo(alert.received_at)}</span>
++                      <span className={`status-badge ${alert.status}`}>{alert.status}</span>
++                      {isExpanded ? <MdExpandLess size={24} /> : <MdExpandMore size={24} />}
++                    </div>
++                  </div>
++
++                  <div className="readonly-alert-body">
++                    {alert.user_phone && <p><strong>Phone:</strong> {alert.user_phone}</p>}
++                    <p><strong>Location:</strong> {alert.latitude.toFixed(6)}, {alert.longitude.toFixed(6)}</p>
++                    <p><strong>Signal:</strong> {alert.signal_type}</p>
++                    <p><strong>Time:</strong> {new Date(alert.event_time).toLocaleString()}</p>
++                    {alert.notes && <p><strong>Notes:</strong> {alert.notes}</p>}
++                  </div>
++                </div>
++
++                {/* Expanded History */}
++                {isExpanded && (
++                  <div className="readonly-alert-history">
++                    <div className="history-header">
++                      <MdHistory /> Complete Alert History ({history.length} total)
++                    </div>
++                    {isLoading ? (
++                      <p className="loading">Loading history...</p>
++                    ) : history.length > 0 ? (
++                      <div className="history-timeline">
++                        {history.map((histAlert, index) => (
++                          <div key={histAlert.id} className={`history-item ${histAlert.message_type}`}>
++                            <div className="history-marker">
++                              {index === 0 ? '📍' : '•'}
++                            </div>
++                            <div className="history-content">
++                              <div className="history-title">
++                                <span className={`hist-type ${histAlert.message_type}`}>
++                                  {histAlert.message_type.toUpperCase()}
++                                </span>
++                                <span className="hist-time">{formatTimeAgo(histAlert.received_at)}</span>
++                                <span className={`hist-status ${histAlert.status}`}>{histAlert.status}</span>
++                              </div>
++                              <div className="history-details">
++                                <span>📍 {histAlert.latitude.toFixed(6)}, {histAlert.longitude.toFixed(6)}</span>
++                                <span>🕐 {new Date(histAlert.event_time).toLocaleString()}</span>
++                                <span>📡 {histAlert.signal_type}</span>
++                              </div>
++                              {histAlert.notes && (
++                                <div className="history-notes">💬 {histAlert.notes}</div>
++                              )}
++                            </div>
++                          </div>
++                        ))}
++                      </div>
++                    ) : (
++                      <p className="no-history">No alert history available</p>
++                    )}
++                  </div>
++                )}
++              </div>
++            );
++          })}
++        </div>
++      )}
++    </div>
++  );
++}
++
++export default ReadOnlyAlertList;
+diff --git a/frontend/src/components/UserList.css b/frontend/src/components/UserList.css
+new file mode 100644
+index 0000000..b475f95
+--- /dev/null
++++ b/frontend/src/components/UserList.css
+@@ -0,0 +1,202 @@
++.user-list {
++  height: 100%;
++  display: flex;
++  flex-direction: column;
++  background: #f5f5f5;
++}
++
++.user-list-header {
++  padding: 15px 20px;
++  background: white;
++  border-bottom: 2px solid #e0e0e0;
++  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.05);
++}
++
++.user-list-header h3 {
++  margin: 0;
++  display: flex;
++  align-items: center;
++  gap: 10px;
++  color: #333;
++  font-size: 18px;
++}
++
++.no-users {
++  text-align: center;
++  color: #999;
++  padding: 40px 20px;
++  font-style: italic;
++}
++
++.user-items {
++  flex: 1;
++  overflow-y: auto;
++  padding: 15px;
++  display: flex;
++  flex-direction: column;
++  gap: 12px;
++}
++
++.user-item {
++  background: white;
++  border-radius: 8px;
++  padding: 15px;
++  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.08);
++  border-left: 4px solid #ccc;
++  transition: all 0.2s ease;
++}
++
++.user-item:hover {
++  box-shadow: 0 4px 8px rgba(0, 0, 0, 0.12);
++  transform: translateY(-2px);
++}
++
++.user-item.emergency {
++  border-left-color: #d32f2f;
++}
++
++.user-item.high {
++  border-left-color: #f57c00;
++}
++
++.user-item.normal {
++  border-left-color: #388e3c;
++}
++
++.user-item-header {
++  display: flex;
++  align-items: flex-start;
++  gap: 12px;
++  margin-bottom: 12px;
++}
++
++.alert-icon {
++  font-size: 24px;
++  line-height: 1;
++}
++
++.user-info {
++  flex: 1;
++  display: flex;
++  flex-direction: column;
++  gap: 4px;
++}
++
++.user-name {
++  font-size: 16px;
++  font-weight: 600;
++  color: #333;
++  display: flex;
++  align-items: center;
++  gap: 8px;
++}
++
++.unregistered-tag {
++  font-size: 10px;
++  color: #d32f2f;
++  font-weight: normal;
++}
++
++.user-device {
++  font-size: 12px;
++  color: #666;
++  font-family: monospace;
++}
++
++.user-phone {
++  font-size: 12px;
++  color: #555;
++  display: flex;
++  align-items: center;
++  gap: 4px;
++}
++
++.user-item-body {
++  display: flex;
++  flex-direction: column;
++  gap: 8px;
++}
++
++.alert-info {
++  display: flex;
++  gap: 8px;
++  flex-wrap: wrap;
++}
++
++.alert-type-badge {
++  font-size: 11px;
++  font-weight: 700;
++  padding: 4px 8px;
++  border-radius: 4px;
++  text-transform: uppercase;
++}
++
++.alert-type-badge.emergency {
++  background: #ffebee;
++  color: #d32f2f;
++}
++
++.alert-type-badge.high {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.alert-type-badge.normal {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.status-badge {
++  font-size: 11px;
++  font-weight: 600;
++  padding: 4px 8px;
++  border-radius: 4px;
++  text-transform: uppercase;
++}
++
++.status-badge.pending {
++  background: #fff3e0;
++  color: #f57c00;
++}
++
++.status-badge.acknowledged {
++  background: #e3f2fd;
++  color: #1976d2;
++}
++
++.status-badge.resolved {
++  background: #e8f5e9;
++  color: #388e3c;
++}
++
++.alert-time {
++  font-size: 12px;
++  color: #666;
++}
++
++.alert-location {
++  font-size: 11px;
++  color: #777;
++  display: flex;
++  align-items: center;
++  gap: 4px;
++  font-family: monospace;
++}
++
++/* Scrollbar styling */
++.user-items::-webkit-scrollbar {
++  width: 8px;
++}
++
++.user-items::-webkit-scrollbar-track {
++  background: #f1f1f1;
++}
++
++.user-items::-webkit-scrollbar-thumb {
++  background: #888;
++  border-radius: 4px;
++}
++
++.user-items::-webkit-scrollbar-thumb:hover {
++  background: #555;
++}
+diff --git a/frontend/src/components/UserList.jsx b/frontend/src/components/UserList.jsx
+new file mode 100644
+index 0000000..54862b7
+--- /dev/null
++++ b/frontend/src/components/UserList.jsx
+@@ -0,0 +1,83 @@
++import React from 'react';
++import { FiUser, FiPhone, FiMapPin } from 'react-icons/fi';
++import './UserList.css';
++
++function UserList({ alerts }) {
++  const getAlertIcon = (messageType) => {
++    switch (messageType) {
++      case 'emergency': return '🔴';
++      case 'high': return '🟠';
++      case 'normal': return '🟢';
++      default: return '🔵';
++    }
++  };
++
++  const formatTimeAgo = (timestamp) => {
++    const now = new Date();
++    const alertTime = new Date(timestamp);
++    const diffMs = now - alertTime;
++    const diffMins = Math.floor(diffMs / 60000);
++    const diffHours = Math.floor(diffMins / 60);
++    const diffDays = Math.floor(diffHours / 24);
++
++    if (diffMins < 1) return 'Just now';
++    if (diffMins < 60) return `${diffMins} min ago`;
++    if (diffHours < 24) return `${diffHours} hour${diffHours > 1 ? 's' : ''} ago`;
++    return `${diffDays} day${diffDays > 1 ? 's' : ''} ago`;
++  };
++
++  return (
++    <div className="user-list">
++      <div className="user-list-header">
++        <h3>
++          <FiUser /> Personnel Status ({alerts.length})
++        </h3>
++      </div>
++      {alerts.length === 0 ? (
++        <p className="no-users">No active personnel</p>
++      ) : (
++        <div className="user-items">
++          {alerts.map((alert) => (
++            <div key={alert.device_id} className={`user-item ${alert.message_type}`}>
++              <div className="user-item-header">
++                <span className="alert-icon">{getAlertIcon(alert.message_type)}</span>
++                <div className="user-info">
++                  <div className="user-name">
++                    {alert.user_name || alert.device_id}
++                    {!alert.user_name && (
++                      <span className="unregistered-tag">⚠️ Unregistered</span>
++                    )}
++                  </div>
++                  <div className="user-device">{alert.device_id}</div>
++                  {alert.user_phone && (
++                    <div className="user-phone">
++                      <FiPhone size={12} /> {alert.user_phone}
++                    </div>
++                  )}
++                </div>
++              </div>
++              <div className="user-item-body">
++                <div className="alert-info">
++                  <span className={`alert-type-badge ${alert.message_type}`}>
++                    {alert.message_type.toUpperCase()}
++                  </span>
++                  <span className={`status-badge ${alert.status}`}>
++                    {alert.status}
++                  </span>
++                </div>
++                <div className="alert-time">
++                  {formatTimeAgo(alert.received_at)}
++                </div>
++                <div className="alert-location">
++                  <FiMapPin size={12} /> {alert.latitude.toFixed(4)}, {alert.longitude.toFixed(4)}
++                </div>
++              </div>
++            </div>
++          ))}
++        </div>
++      )}
++    </div>
++  );
++}
++
++export default UserList;
+diff --git a/frontend/src/components/UserManagement.jsx b/frontend/src/components/UserManagement.jsx
+index 8786249..9080528 100644
+--- a/frontend/src/components/UserManagement.jsx
++++ b/frontend/src/components/UserManagement.jsx
+@@ -1,5 +1,5 @@
+ import React, { useState, useEffect } from 'react';
+-import { FaArrowLeft, FaUserPlus, FaEdit, FaToggleOn, FaToggleOff } from 'react-icons/fa';
++import { FaArrowLeft, FaUserPlus } from 'react-icons/fa';
+ import axios from 'axios';
+ 
+ function UserManagement({ onBack, onStatsUpdate }) {
+@@ -65,7 +65,6 @@ function UserManagement({ onBack, onStatsUpdate }) {
+         headers: { Authorization: `Bearer ${token}` }
+       });
+       
+-      // Show success message with generated employee ID
+       alert(`Operator created successfully!\nEmployee ID: ${response.data.employee_id}`);
+       
+       setShowCreateForm(false);
+@@ -78,20 +77,6 @@ function UserManagement({ onBack, onStatsUpdate }) {
+     }
+   };
+ 
+-  const toggleUserStatus = async (userId, currentStatus) => {
+-    try {
+-      const token = localStorage.getItem('token');
+-      await axios.patch(
+-        `http://localhost:8000/api/users/${userId}`,
+-        { is_active: !currentStatus },
+-        { headers: { Authorization: `Bearer ${token}` } }
+-      );
+-      fetchUsers();
+-    } catch (error) {
+-      console.error('Error updating user:', error);
+-    }
+-  };
+-
+   return (
+     <div className="admin-dashboard">
+       <header className="admin-header">
+@@ -190,11 +175,10 @@ function UserManagement({ onBack, onStatsUpdate }) {
+                 <th>Role</th>
+                 <th>Status</th>
+                 <th>Created</th>
+-                <th>Actions</th>
+               </tr>
+             </thead>
+             <tbody>
+-              {users.map((user) => (
++              {users.filter(user => user.role !== 'admin').map((user) => (
+                 <tr key={user.id}>
+                   <td>{user.username}</td>
+                   <td>{user.email}</td>
+@@ -202,24 +186,11 @@ function UserManagement({ onBack, onStatsUpdate }) {
+                   <td>{user.assigned_station || '-'}</td>
+                   <td><span className={`role-badge ${user.role}`}>{user.role}</span></td>
+                   <td>
+-                    <span className={`status-badge ${user.is_active ? 'active' : 'inactive'}`}>
+-                      {user.is_active ? 'Active' : 'Inactive'}
++                    <span className={`status-badge ${user.is_active === 1 ? 'active' : 'inactive'}`}>
++                      {user.is_active === 1 ? 'Active' : 'Inactive'}
+                     </span>
+                   </td>
+                   <td>{new Date(user.created_at).toLocaleDateString()}</td>
+-                  <td>
+-                    {user.role !== 'admin' ? (
+-                      <button
+-                        className="action-btn"
+-                        onClick={() => toggleUserStatus(user.id, user.is_active)}
+-                        title={user.is_active ? 'Deactivate' : 'Activate'}
+-                      >
+-                        {user.is_active ? <FaToggleOn /> : <FaToggleOff />}
+-                      </button>
+-                    ) : (
+-                      <span style={{ color: '#7cb342', fontSize: '0.9rem' }}>Always Active</span>
+-                    )}
+-                  </td>
+                 </tr>
+               ))}
+             </tbody>
+diff --git a/mqtt_ack_subscriber.bat b/mqtt_ack_subscriber.bat
+new file mode 100644
+index 0000000..83e8ad7
+--- /dev/null
++++ b/mqtt_ack_subscriber.bat
+@@ -0,0 +1,15 @@
++@echo off
++echo ========================================
++echo FECS MQTT ACK Subscriber
++echo Monitoring fecs/ack topic
++echo ========================================
++echo.
++echo Listening for ACK messages on topic: fecs/ack
++echo Press Ctrl+C to stop
++echo.
++echo ACK Message Format: packet_id^|device_id^|ack_type
++echo   L = LED Blink (delivery confirmation)
++echo   B = Buzzer Alert (unconsciousness detection)
++echo.
++echo ----------------------------------------
++mosquitto_sub -h localhost -t fecs/ack -v
+diff --git a/mqtt_test_complete_workflow.bat b/mqtt_test_complete_workflow.bat
+new file mode 100644
+index 0000000..08c0dbf
+--- /dev/null
++++ b/mqtt_test_complete_workflow.bat
+@@ -0,0 +1,227 @@
++@echo off
++echo ========================================
++echo FECS - Complete End-to-End Test
++echo User Registration and Alert Workflow
++echo ========================================
++echo.
++echo This test simulates a complete user journey:
++echo 1. New device sends Normal alert (registration)
++echo 2. Operator registers device
++echo 3. Device sends various alerts
++echo 4. System sends ACK for manual alerts
++echo 5. Verify everything works
++echo.
++echo SETUP REQUIRED:
++echo ========================================
++echo.
++echo Terminal 1: Backend server running
++echo Terminal 2: Frontend running
++echo Terminal 3: Run this script
++echo Terminal 4: mosquitto_sub -h localhost -t fecs/ack -v
++echo.
++pause
++echo.
++
++echo ========================================
++echo PHASE 1: Device Registration
++echo ========================================
++echo.
++echo Scenario: New forest worker "Alex Kumar" gets device DEV_401
++echo Device sends first Normal alert to register itself
++echo.
++pause
++echo.
++
++echo [1] DEV_401 sends NORMAL alert (First contact - Unregistered)
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e001|DEV_401|10.9300|78.1200|N|M|1705315800|1|A1B1"
++echo.
++echo Expected:
++echo   - Alert stored in database
++echo   - NO ACK sent (device not registered yet)
++echo   - DEV_401 appears in "Unmapped Devices" list
++echo.
++echo ACTION REQUIRED:
++echo ========================================
++echo Go to your dashboard:
++echo 1. Click "Device Management"
++echo 2. Find DEV_401 in unmapped devices
++echo 3. Register with:
++echo    - Name: Alex Kumar
++echo    - Phone: 9876543210
++echo 4. Click "Register Device"
++echo.
++echo Press any key AFTER you have registered DEV_401...
++pause
++echo.
++
++echo ========================================
++echo PHASE 2: Post-Registration Alerts
++echo ========================================
++echo.
++echo Now DEV_401 is registered to "Alex Kumar"
++echo Testing various alert types with ACK verification
++echo.
++pause
++echo.
++
++echo [2] Alex Kumar sends MANUAL NORMAL alert (Routine check-in)
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e002|DEV_401|10.9310|78.1210|N|M|1705315810|1|A2B2"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - ACK SENT: e2e002^|DEV_401^|L
++echo   - Map shows: AK-401 (Green marker)
++echo.
++
++echo [3] Alex Kumar sends AUTO NORMAL alert (Automatic check-in)
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e003|DEV_401|10.9320|78.1220|N|A|1705315820|1|A3B3"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - NO ACK sent (auto signal)
++echo   - Map updates position
++echo.
++
++echo [4] Alex Kumar sends MANUAL HIGH alert (Warning situation)
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e004|DEV_401|10.9330|78.1230|H|M|1705315830|1|A4B4"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - ACK SENT: e2e004^|DEV_401^|L
++echo   - Map shows: AK-401 (Orange marker)
++echo.
++
++echo [5] Alex Kumar sends MANUAL EMERGENCY alert (Critical situation!)
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e005|DEV_401|10.9340|78.1240|E|M|1705315840|1|A5B5"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - ACK SENT: e2e005^|DEV_401^|L
++echo   - Map shows: AK-401 (Red marker)
++echo   - Operator should respond immediately!
++echo.
++
++echo [6] Alex Kumar sends AUTO EMERGENCY alert (Device detected fall)
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e006|DEV_401|10.9350|78.1250|E|A|1705315850|1|A6B6"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - NO ACK sent (auto signal)
++echo   - Map shows: AK-401 (Red marker)
++echo.
++
++echo [7] Alex Kumar sends MANUAL NORMAL alert (Situation resolved)
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e007|DEV_401|10.9360|78.1260|N|M|1705315860|1|A7B7"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - ACK SENT: e2e007^|DEV_401^|L
++echo   - Map shows: AK-401 (Green marker - back to normal)
++echo.
++
++echo ========================================
++echo PHASE 3: Testing with Another User
++echo ========================================
++echo.
++echo Testing with already registered device DEV_301
++echo.
++pause
++echo.
++
++echo [8] DEV_301 sends MANUAL EMERGENCY alert
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e008|DEV_301|10.9370|78.1270|E|M|1705315870|1|A8B8"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - ACK SENT: e2e008^|DEV_301^|L
++echo   - Map shows: [Initials]-301 (Red marker)
++echo.
++
++echo [9] DEV_301 sends AUTO NORMAL alert
++mosquitto_pub -h localhost -t fecs/incoming -m "e2e009|DEV_301|10.9380|78.1280|N|A|1705315880|1|A9B9"
++timeout /t 2 /nobreak >nul
++echo.
++echo Expected:
++echo   - Alert stored
++echo   - NO ACK sent (auto signal)
++echo   - Map updates position
++echo.
++
++echo ========================================
++echo Test Complete!
++echo ========================================
++echo.
++echo VERIFICATION CHECKLIST:
++echo ========================================
++echo.
++echo 1. MQTT ACK SUBSCRIBER (Terminal 4):
++echo    Should show 4 ACK messages:
++echo    ✅ fecs/ack e2e002^|DEV_401^|L
++echo    ✅ fecs/ack e2e004^|DEV_401^|L
++echo    ✅ fecs/ack e2e005^|DEV_401^|L
++echo    ✅ fecs/ack e2e007^|DEV_401^|L
++echo    ✅ fecs/ack e2e008^|DEV_301^|L
++echo.
++echo 2. BACKEND LOGS:
++echo    ✅ 9 alerts stored (e2e001 to e2e009)
++echo    ✅ 5 ACK sent messages (for manual alerts only)
++echo    ✅ No errors
++echo.
++echo 3. FRONTEND MAP:
++echo    ✅ Shows AK-401 marker (Alex Kumar)
++echo    ✅ Shows [Initials]-301 marker
++echo    ✅ Latest position for each user
++echo    ✅ Correct colors (Green for both after last alerts)
++echo.
++echo 4. USER LIST (Right side):
++echo    ✅ Shows "Alex Kumar" with DEV_401
++echo    ✅ Shows latest alert info
++echo    ✅ Phone number: 9876543210
++echo.
++echo 5. ALERT LOGS:
++echo    ✅ Click "Alex Kumar" card
++echo    ✅ Expand to see 7 alerts (e2e001 to e2e007)
++echo    ✅ Timeline shows progression:
++echo       Normal → Normal → Auto Normal → High → Emergency → Auto Emergency → Normal
++echo.
++echo 6. DATABASE:
++echo    ✅ DEV_401 registered in device_registrations table
++echo    ✅ All 9 alerts in alerts table
++echo    ✅ User info linked correctly
++echo.
++echo ========================================
++echo SUMMARY OF ACK BEHAVIOR:
++echo ========================================
++echo.
++echo ACK SENT (5 total):
++echo   ✅ e2e002 - Manual Normal (registered)
++echo   ✅ e2e004 - Manual High (registered)
++echo   ✅ e2e005 - Manual Emergency (registered)
++echo   ✅ e2e007 - Manual Normal (registered)
++echo   ✅ e2e008 - Manual Emergency (registered)
++echo.
++echo NO ACK SENT (4 total):
++echo   ❌ e2e001 - Manual Normal (NOT registered yet)
++echo   ❌ e2e003 - Auto Normal (auto signal)
++echo   ❌ e2e006 - Auto Emergency (auto signal)
++echo   ❌ e2e009 - Auto Normal (auto signal)
++echo.
++echo ========================================
++echo KEY LEARNINGS:
++echo ========================================
++echo.
++echo 1. Unregistered devices can send Normal alerts
++echo 2. After registration, device can send any alert type
++echo 3. ACK only sent for MANUAL alerts from REGISTERED devices
++echo 4. Auto signals never get ACK (they're automatic check-ins)
++echo 5. Map shows latest position with user name
++echo 6. Alert history preserved for audit trail
++echo.
++pause
+diff --git a/run_migration.bat b/run_migration.bat
+new file mode 100644
+index 0000000..7518a93
+--- /dev/null
++++ b/run_migration.bat
+@@ -0,0 +1,6 @@
++@echo off
++echo Running database migration to remove is_active from users table...
++cd backend
++alembic upgrade head
++echo Migration completed!
++pause

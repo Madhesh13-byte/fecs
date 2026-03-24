@@ -33,7 +33,7 @@ pause
 echo.
 
 echo [1] DEV_401 sends NORMAL alert (First contact - Unregistered)
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e001|DEV_401|10.9300|78.1200|N|M|1705315800|1|A1B1"
+mosquitto_pub -h localhost -t fecs/incoming -m "e2e001|DEV_401|10.9300|78.1200|N|1705315800|A1B1"
 echo.
 echo Expected:
 echo   - Alert stored in database
@@ -65,7 +65,7 @@ pause
 echo.
 
 echo [2] Alex Kumar sends MANUAL NORMAL alert (Routine check-in)
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e002|DEV_401|10.9310|78.1210|N|M|1705315810|1|A2B2"
+mosquitto_pub -h localhost -t fecs/incoming -m "T001|DEV_401|10.9310|78.1210|N|1705315810|A2B2"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:
@@ -75,7 +75,7 @@ echo   - Map shows: AK-401 (Green marker)
 echo.
 
 echo [3] Alex Kumar sends AUTO NORMAL alert (Automatic check-in)
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e003|DEV_401|10.9320|78.1220|N|A|1705315820|1|A3B3"
+mosquitto_pub -h localhost -t fecs/incoming -m "T002|DEV_401|10.9320|78.1220|N|1705315820|A3B3"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:
@@ -85,7 +85,7 @@ echo   - Map updates position
 echo.
 
 echo [4] Alex Kumar sends MANUAL HIGH alert (Warning situation)
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e004|DEV_401|10.9330|78.1230|H|M|1705315830|1|A4B4"
+mosquitto_pub -h localhost -t fecs/incoming -m "T003|DEV_401|10.9330|78.1230|H|1705315830|A4B4"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:
@@ -95,7 +95,7 @@ echo   - Map shows: AK-401 (Orange marker)
 echo.
 
 echo [5] Alex Kumar sends MANUAL EMERGENCY alert (Critical situation!)
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e005|DEV_401|10.9340|78.1240|E|M|1705315840|1|A5B5"
+mosquitto_pub -h localhost -t fecs/incoming -m "T004|DEV_401|10.9340|78.1240|E|1705315840|A5B5"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:
@@ -106,7 +106,7 @@ echo   - Operator should respond immediately!
 echo.
 
 echo [6] Alex Kumar sends AUTO EMERGENCY alert (Device detected fall)
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e006|DEV_401|10.9350|78.1250|E|A|1705315850|1|A6B6"
+mosquitto_pub -h localhost -t fecs/incoming -m "T005|DEV_401|10.9350|78.1250|E|1705315850|A6B6"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:
@@ -116,7 +116,7 @@ echo   - Map shows: AK-401 (Red marker)
 echo.
 
 echo [7] Alex Kumar sends MANUAL NORMAL alert (Situation resolved)
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e007|DEV_401|10.9360|78.1260|N|M|1705315860|1|A7B7"
+mosquitto_pub -h localhost -t fecs/incoming -m "T006|DEV_401|10.9360|78.1260|N|1705315860|A7B7"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:
@@ -135,7 +135,7 @@ pause
 echo.
 
 echo [8] DEV_301 sends MANUAL EMERGENCY alert
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e008|DEV_301|10.9370|78.1270|E|M|1705315870|1|A8B8"
+mosquitto_pub -h localhost -t fecs/incoming -m "T009|DEV_301|10.9370|78.1270|E|1705315870|A8B8"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:
@@ -145,7 +145,7 @@ echo   - Map shows: [Initials]-301 (Red marker)
 echo.
 
 echo [9] DEV_301 sends AUTO NORMAL alert
-mosquitto_pub -h localhost -t fecs/incoming -m "e2e009|DEV_301|10.9380|78.1280|N|A|1705315880|1|A9B9"
+mosquitto_pub -h localhost -t fecs/incoming -m "T110|DEV_301|10.9380|78.1280|N|1705315880|A9B9"
 timeout /t 2 /nobreak >nul
 echo.
 echo Expected:

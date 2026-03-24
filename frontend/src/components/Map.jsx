@@ -13,11 +13,13 @@ L.Icon.Default.mergeOptions({
 });
 
 const getMarkerColor = (messageType) => {
-  switch (messageType) {
+  switch (messageType?.toLowerCase()) {
     case 'emergency': return '#d32f2f';
     case 'high': return '#f57c00';
     case 'normal': return '#388e3c';
-    default: return '#1976d2';
+    case 'automated': return '#7b1fa2';
+    case 'cancel': return '#1976d2';
+    default: return '#607d8b';
   }
 };
 
@@ -41,6 +43,8 @@ const createCustomMarker = (alert, color, isOutOfBounds) => {
   const deviceNum = getDeviceNumber(alert.device_id);
   const label = `${initials}-${deviceNum}`;
   const bgColor = isOutOfBounds ? '#ffeb3b' : color;
+  const typeLC = alert.message_type?.toLowerCase();
+  const icon = typeLC === 'automated' ? ' 🤖' : typeLC === 'emergency' ? ' 🚨' : '';
   
   return L.divIcon({
     className: 'custom-marker-label',
@@ -57,10 +61,10 @@ const createCustomMarker = (alert, color, isOutOfBounds) => {
         white-space: nowrap;
         text-align: center;
         font-family: Arial, sans-serif;
-      ">${label}</div>
+      ">${label}${icon}</div>
     `,
-    iconSize: [60, 30],
-    iconAnchor: [30, 15],
+    iconSize: [70, 30],
+    iconAnchor: [35, 15],
   });
 };
 

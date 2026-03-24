@@ -2,7 +2,7 @@ import asyncio
 import logging
 from datetime import datetime
 from app.database import SessionLocal
-from app.models import MonitoringStatus, Alert, MessageType, SignalType
+from app.models import MonitoringStatus, Alert, MessageType
 from app.services.ack_service import publish_buzzer_ack
 from app.services.alert_service import calculate_distance, store_alert
 from app.schemas import IncomingAlert
@@ -52,9 +52,7 @@ class MonitoringService:
                         "latitude": status.last_latitude or 0.0,
                         "longitude": status.last_longitude or 0.0,
                         "message_type": "emergency",
-                        "signal_type": "auto",
-                        "event_time": now.isoformat(),
-                        "source": "software"
+                        "event_time": now.isoformat()
                     }
                     alert_schema = IncomingAlert(**emergency_data)
                     new_alert = store_alert(db, alert_schema)
@@ -74,11 +72,9 @@ class MonitoringService:
                                 "latitude": new_alert.latitude,
                                 "longitude": new_alert.longitude,
                                 "message_type": new_alert.message_type.value,
-                                "signal_type": new_alert.signal_type.value,
                                 "event_time": new_alert.event_time.isoformat(),
                                 "received_at": new_alert.received_at.isoformat(),
-                                "status": new_alert.status.value,
-                                "source": new_alert.source
+                                "status": new_alert.status.value
                             }
                         }))
 
@@ -87,7 +83,6 @@ class MonitoringService:
             for status in statuses:
                 auto_alerts = db.query(Alert).filter(
                     Alert.device_id == status.device_id,
-                    Alert.signal_type == SignalType.AUTO,
                     Alert.message_type == MessageType.NORMAL
                 ).order_by(Alert.event_time.desc()).limit(2).all()
                 

@@ -27,7 +27,11 @@ function AlertLogs({ onBack }) {
       const response = await axios.get('http://localhost:8000/api/alerts', {
         headers: { Authorization: `Bearer ${token}` }
       });
-      setAlerts(response.data);
+      // Sort by newest first
+      const sortedAlerts = response.data.sort((a, b) => 
+        new Date(b.event_time) - new Date(a.event_time)
+      );
+      setAlerts(sortedAlerts);
     } catch (error) {
       console.error('Error fetching alerts:', error);
     }
@@ -46,25 +50,24 @@ function AlertLogs({ onBack }) {
       filtered = filtered.filter(a => a.device_id.toLowerCase().includes(filters.deviceId.toLowerCase()));
     }
     if (filters.messageType) {
-      filtered = filtered.filter(a => a.message_type === filters.messageType);
+      filtered = filtered.filter(a => a.message_type?.toLowerCase() === filters.messageType.toLowerCase());
     }
     if (filters.status) {
-      filtered = filtered.filter(a => a.status === filters.status);
+      filtered = filtered.filter(a => a.status?.toLowerCase() === filters.status.toLowerCase());
     }
 
     setFilteredAlerts(filtered);
   };
 
   const exportToCSV = () => {
-    const headers = ['Time', 'Device ID', 'Type', 'Signal', 'Status', 'Location', 'Notes'];
+    const headers = ['Time', 'Device ID', 'Type', 'ACK', 'Status', 'Location'];
     const rows = filteredAlerts.map(a => [
       new Date(a.event_time).toLocaleString(),
       a.device_id,
       a.message_type,
-      a.signal_type,
+      a.ack_sent || 'none',
       a.status,
-      `${a.latitude}, ${a.longitude}`,
-      a.notes || ''
+      `${a.latitude}, ${a.longitude}`
     ]);
 
     const csv = [headers, ...rows].map(row => row.join(',')).join('\n');
@@ -77,7 +80,7 @@ function AlertLogs({ onBack }) {
   };
 
   const getStatusColor = (status) => {
-    switch (status) {
+    switch (status?.toLowerCase()) {
       case 'pending': return '#f57c00';
       case 'acknowledged': return '#1976d2';
       case 'resolved': return '#388e3c';
@@ -86,12 +89,22 @@ function AlertLogs({ onBack }) {
   };
 
   const getTypeColor = (type) => {
-    switch (type) {
+    switch (type?.toLowerCase()) {
       case 'emergency': return '#c62828';
       case 'warning': return '#f57c00';
       case 'normal': return '#388e3c';
+      case 'automated': return '#9c27b0';
+      case 'high': return '#f57c00';
+      case 'cancel': return '#1976d2';
       default: return '#757575';
     }
+  };
+
+  const getAckDisplay = (ack) => {
+    const val = ack?.toLowerCase();
+    if (val === 'led') return '🔔 LED';
+    if (val === 'buzzer_led') return '🔔🚨 BUZZER+LED';
+    return '—';
   };
 
   return (
@@ -175,10 +188,9 @@ function AlertLogs({ onBack }) {
                 <th>Time</th>
                 <th>Device ID</th>
                 <th>Type</th>
-                <th>Signal</th>
+                <th>ACK</th>
                 <th>Status</th>
                 <th>Location</th>
-                <th>Notes</th>
               </tr>
             </thead>
             <tbody>
@@ -194,7 +206,7 @@ function AlertLogs({ onBack }) {
                       {alert.message_type}
                     </span>
                   </td>
-                  <td>{alert.signal_type}</td>
+                  <td>{getAckDisplay(alert.ack_sent)}</td>
                   <td>
                     <span
                       className="status-badge"
@@ -204,7 +216,6 @@ function AlertLogs({ onBack }) {
                     </span>
                   </td>
                   <td>{alert.latitude.toFixed(4)}, {alert.longitude.toFixed(4)}</td>
-                  <td className="notes-cell">{alert.notes || '-'}</td>
                 </tr>
               ))}
             </tbody>

@@ -4,19 +4,22 @@ from app.database import Base
 import enum
 
 class MessageType(str, enum.Enum):
-    NORMAL = "normal"
-    HIGH = "high"
-    EMERGENCY = "emergency"
-    CANCEL = "cancel"
+    NORMAL = "NORMAL"
+    HIGH = "HIGH"
+    EMERGENCY = "EMERGENCY"
+    CANCEL = "CANCEL"
+    AUTOMATED = "AUTOMATED"
 
-class SignalType(str, enum.Enum):
-    MANUAL = "manual"
-    AUTO = "auto"
 
 class AlertStatus(str, enum.Enum):
     PENDING = "pending"
     ACKNOWLEDGED = "acknowledged"
     RESOLVED = "resolved"
+
+class AckType(str, enum.Enum):
+    NONE       = "none"        # CANCEL — no ACK sent
+    LED        = "led"         # Standard delivery ACK
+    BUZZER_LED = "buzzer_led"  # Stationary AUTOMATED — Buzzer + LED
 
 class UserRole(str, enum.Enum):
     ADMIN = "admin"
@@ -31,12 +34,11 @@ class Alert(Base):
     latitude = Column(Float, nullable=False)
     longitude = Column(Float, nullable=False)
     message_type = Column(Enum(MessageType), nullable=False)
-    signal_type = Column(Enum(SignalType), nullable=False)
     event_time = Column(DateTime, nullable=False)
     received_at = Column(DateTime, server_default=func.now(), nullable=False)
     status = Column(Enum(AlertStatus), default=AlertStatus.PENDING, nullable=False)
-    source = Column(String, nullable=False)
     notes = Column(String, nullable=True)
+    ack_sent = Column(Enum(AckType), default=AckType.NONE, nullable=True)
 
 class User(Base):
     __tablename__ = "users"

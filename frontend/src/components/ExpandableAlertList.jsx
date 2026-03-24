@@ -47,20 +47,24 @@ function ExpandableAlertList({ alerts, token, onUpdate }) {
   };
 
   const getAlertClass = (messageType) => {
-    switch (messageType) {
+    switch (messageType?.toLowerCase()) {
       case 'emergency': return 'alert-item emergency';
       case 'high': return 'alert-item high';
       case 'normal': return 'alert-item normal';
+      case 'automated': return 'alert-item automated';
+      case 'cancel': return 'alert-item cancel';
       default: return 'alert-item';
     }
   };
 
   const getAlertIcon = (messageType) => {
-    switch (messageType) {
+    switch (messageType?.toLowerCase()) {
       case 'emergency': return '🔴';
       case 'high': return '🟠';
       case 'normal': return '🟢';
-      default: return '🔵';
+      case 'cancel': return '🔵';
+      case 'automated': return '🤖';
+      default: return '⚪';
     }
   };
 
@@ -173,13 +177,13 @@ function ExpandableAlertList({ alerts, token, onUpdate }) {
                     ) : history.length > 0 ? (
                       <div className="history-timeline">
                         {history.map((histAlert, index) => (
-                          <div key={histAlert.id} className={`history-item ${histAlert.message_type}`}>
+                          <div key={histAlert.id} className={`history-item ${histAlert.message_type?.toLowerCase()}`}>
                             <div className="history-marker">
                               {index === 0 ? '📍' : '•'}
                             </div>
                             <div className="history-content">
                               <div className="history-title">
-                                <span className={`hist-type ${histAlert.message_type}`}>
+                                <span className={`hist-type ${histAlert.message_type?.toLowerCase()}`}>
                                   {histAlert.message_type.toUpperCase()}
                                 </span>
                                 <span className="hist-time">{formatTimeAgo(histAlert.received_at)}</span>

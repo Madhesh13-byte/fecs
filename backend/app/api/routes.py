@@ -6,7 +6,8 @@ from app.database import get_db
 from app.models import Alert, User, UserRole, AlertStatus, DeviceRegistration, MessageType
 from app.schemas import (
     AlertResponse, UserCreate, UserResponse, Token, AlertStatusUpdate,
-    DeviceRegistrationCreate, DeviceRegistrationResponse, UnmappedDevice
+    DeviceRegistrationCreate, DeviceRegistrationResponse, UnmappedDevice,
+    ManualMessageCreate
 )
 from app.services.auth_service import (
     verify_password, get_password_hash, create_access_token, verify_token
@@ -223,11 +224,9 @@ async def get_alerts(
             "latitude": alert.latitude,
             "longitude": alert.longitude,
             "message_type": alert.message_type,
-            "signal_type": alert.signal_type,
             "event_time": alert.event_time,
             "received_at": alert.received_at,
             "status": alert.status,
-            "source": alert.source,
             "notes": alert.notes,
             "user_name": user_name,
             "user_phone": user_phone
@@ -267,11 +266,9 @@ async def get_device_alert_history(
             "latitude": alert.latitude,
             "longitude": alert.longitude,
             "message_type": alert.message_type,
-            "signal_type": alert.signal_type,
             "event_time": alert.event_time,
             "received_at": alert.received_at,
             "status": alert.status,
-            "source": alert.source,
             "notes": alert.notes,
             "user_name": user_name,
             "user_phone": user_phone
@@ -308,11 +305,9 @@ async def get_alert(
         "latitude": alert.latitude,
         "longitude": alert.longitude,
         "message_type": alert.message_type,
-        "signal_type": alert.signal_type,
         "event_time": alert.event_time,
         "received_at": alert.received_at,
         "status": alert.status,
-        "source": alert.source,
         "notes": alert.notes,
         "user_name": user_name,
         "user_phone": user_phone
@@ -505,3 +500,57 @@ async def get_devices_by_station(
         })
     
     return station_data
+
+# Manual Message Sending endpoint
+@router.post("/messages/send")
+async def send_manual_message(
+    message: ManualMessageCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user)
+):
+    """Send manual message (high, emergency, cancel) to a device"""
+    from app.mqtt_handler import mqtt_handler
+    from app.services.ack_service import publish_buzzer_ack
+    from datetime import datetime
+    import uuid
+    
+    # Validate device is registered
+    device_reg = db.query(DeviceRegistration).filter(
+        DeviceRegistration.device_id == message.device_id,
+        DeviceRegistration.is_active == 1
+    ).first()
+    
+    if not device_reg:
+        raise HTTPException(status_code=404, detail="Device not registered")
+    
+    # Validate message type (only high, emergency, cancel allowed)
+    if message.message_type == MessageType.NORMAL:
+        raise HTTPException(status_code=400, detail="NORMAL messages are sent by hardware only")
+    
+    # Create alert record
+    from app.models import Alert, AlertStatus
+    packet_id = f"MAN_{int(datetime.utcnow().timestamp())}_{uuid.uuid4().hex[:6]}"
+    
+    alert = Alert(
+        packet_id=packet_id,
+        device_id=message.device_id,
+        latitude=message.latitude,
+        longitude=message.longitude,
+        message_type=message.message_type,
+        event_time=datetime.utcnow(),
+        status=AlertStatus.PENDING
+    )
+    
+    db.add(alert)
+    db.commit()
+    db.refresh(alert)
+    
+    # Send buzzer ACK to device via MQTT
+    if mqtt_handler.client:
+        await publish_buzzer_ack(message.device_id, mqtt_handler.client)
+    
+    return {
+        "message": "Manual message sent successfully",
+        "alert_id": alert.id,
+        "packet_id": packet_id
+    }
