@@ -1,5 +1,5 @@
 import React, { useEffect } from 'react';
-import { MapContainer, TileLayer, Marker, Popup, Circle, useMap } from 'react-leaflet';
+import { MapContainer, TileLayer, Marker, Popup, Circle, useMap, LayersControl } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import './Map.css';
@@ -85,14 +85,24 @@ function FitBounds({ station }) {
       // 1. Initial framing
       map.fitBounds(bounds, { padding: [10, 10] });
       
-      // 2. Hard lock the operator's camera bounds to this exact box
-      map.setMaxBounds(bounds);
-      map.options.maxBoundsViscosity = 1.0;
+      // 2. We used to hard lock the camera to these bounds here via map.setMaxBounds(bounds),
+      // but this prevents operators from dragging/panning the map if their screen already fits the zone.
+      // So we leave maxBounds null so they can freely move around.
+      map.setMaxBounds(null);
     } else {
       // Remove constraints if no station is assigned (e.g., admin map view)
       map.setMaxBounds(null);
     }
   }, [station?.id, map]); 
+  return null;
+}
+
+function MapFixer() {
+  const map = useMap();
+  useEffect(() => {
+    const timer = setTimeout(() => map.invalidateSize(), 150);
+    return () => clearTimeout(timer);
+  }, [map]);
   return null;
 }
 
@@ -107,11 +117,35 @@ function Map({ alerts, baseStation }) {
       center={center} 
       zoom={baseStation ? 13 : 10} 
       className="map"
+      dragging={true}
+      touchZoom={true}
+      scrollWheelZoom={true}
+      keyboard={true}
     >
-      <TileLayer
-        url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-        attribution='&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors'
-      />
+      <MapFixer />
+      <LayersControl position="topright">
+        <LayersControl.BaseLayer checked name="Standard (Road Map)">
+          <TileLayer
+            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"
+            attribution='Tiles &copy; Esri'
+          />
+        </LayersControl.BaseLayer>
+        
+        <LayersControl.BaseLayer name="Satellite (Aerial Imagery)">
+          <TileLayer
+            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+            attribution='Tiles &copy; Esri'
+          />
+        </LayersControl.BaseLayer>
+        
+        <LayersControl.BaseLayer name="Topographic / Terrain">
+          <TileLayer
+            url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"
+            attribution='Tiles &copy; Esri'
+          />
+        </LayersControl.BaseLayer>
+      </LayersControl>
+      
       <FitBounds station={baseStation} />
       
       {/* Draw the massive transparent green radio coverage area */}

@@ -5,8 +5,6 @@
   animation: gradientShift 10s ease infinite;
   color: #333;
   overflow-x: hidden;
-  cursor: default;
-  user-select: none;
   position: relative;
 }
 

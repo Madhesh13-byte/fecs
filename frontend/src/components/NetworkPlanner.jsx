@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { FaArrowLeft, FaSave, FaBroadcastTower } from 'react-icons/fa';
-import { MapContainer, TileLayer, Circle, Popup, useMapEvents } from 'react-leaflet';
+import { MapContainer, TileLayer, Circle, Popup, useMapEvents, LayersControl, useMap } from 'react-leaflet';
 import L from 'leaflet';
 import 'leaflet/dist/leaflet.css';
 import { getBaseStations, createBaseStation } from '../services/api';
@@ -20,6 +20,17 @@ function MapClickHandler({ onLocationSelect }) {
       onLocationSelect(e.latlng);
     },
   });
+  return null;
+}
+
+function MapFixer() {
+  const map = useMap();
+  useEffect(() => {
+    // Leaflet often computes a size of 0x0 when placed in a dynamic flexbox.
+    // This hook invalidates the size after the flex layout settles, fixing dragging.
+    const timer = setTimeout(() => map.invalidateSize(), 150);
+    return () => clearTimeout(timer);
+  }, [map]);
   return null;
 }
 
@@ -104,11 +115,35 @@ function NetworkPlanner({ onBack }) {
           <MapContainer 
             center={[10.8050, 78.6856]} 
             zoom={10} 
-            style={{ height: '100%', width: '100%' }}
+            dragging={true}
+            touchZoom={true}
+            scrollWheelZoom={true}
+            keyboard={true}
+            style={{ height: '100%', width: '100%', minHeight: '400px' }}
           >
-            <TileLayer
-              url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
-            />
+            <MapFixer />
+            <LayersControl position="topright">
+              <LayersControl.BaseLayer checked name="Standard (Road Map)">
+                <TileLayer
+                  url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Street_Map/MapServer/tile/{z}/{y}/{x}"
+                  attribution='Tiles &copy; Esri'
+                />
+              </LayersControl.BaseLayer>
+              
+              <LayersControl.BaseLayer name="Satellite (Aerial Imagery)">
+                <TileLayer
+                  url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}"
+                  attribution='Tiles &copy; Esri'
+                />
+              </LayersControl.BaseLayer>
+              
+              <LayersControl.BaseLayer name="Topographic / Terrain">
+                <TileLayer
+                  url="https://server.arcgisonline.com/ArcGIS/rest/services/World_Topo_Map/MapServer/tile/{z}/{y}/{x}"
+                  attribution='Tiles &copy; Esri'
+                />
+              </LayersControl.BaseLayer>
+            </LayersControl>
             <MapClickHandler onLocationSelect={handleMapClick} />
             
             {/* Render existing stations */}
