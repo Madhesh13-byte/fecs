@@ -24,7 +24,12 @@ class MQTTHandler:
         try:
             # Parse pipe-delimited format: packet_id|device_id|lat|lon|msg_type|timestamp|checksum
             # Hardware devices send location pings with message types
-            parts = message.strip().split('|')
+            message = message.strip()
+            if not (message.startswith('<') and message.endswith('>')):
+                logger.warning(f"Rejected unframed message: {message}")
+                return
+            message = message[1:-1]
+            parts = message.split('|')
             
             if len(parts) < 6:
                 logger.error(f"Invalid message format: {message}")

@@ -1,10 +1,13 @@
 import React, { useState, useEffect } from 'react';
 import { FaUsers, FaClipboardList, FaSignOutAlt, FaTree, FaArrowLeft, FaMapMarkedAlt } from 'react-icons/fa';
 import axios from 'axios';
+
 import UserManagement from './UserManagement';
 import AlertLogs from './AlertLogs';
 import BaseStationView from './BaseStationView';
 import NetworkPlanner from './NetworkPlanner';
+import CoverageAnalysis from './CoverageAnalysis'; // ✅ NEW
+
 import './AdminDashboard.css';
 
 function AdminDashboard({ onLogout }) {
@@ -32,6 +35,10 @@ function AdminDashboard({ onLogout }) {
     }
   };
 
+  // =========================
+  // 🔥 VIEW SWITCHES
+  // =========================
+
   if (view === 'users') {
     return <UserManagement onBack={() => setView('home')} onStatsUpdate={fetchStats} />;
   }
@@ -39,9 +46,13 @@ function AdminDashboard({ onLogout }) {
   if (view === 'logs') {
     return <AlertLogs onBack={() => setView('home')} />;
   }
-  
+
   if (view === 'planner') {
     return <NetworkPlanner onBack={() => setView('home')} />;
+  }
+
+  if (view === 'coverage') {
+    return <CoverageAnalysis onBack={() => setView('home')} />; // ✅ NEW
   }
 
   if (view === 'stations') {
@@ -62,12 +73,17 @@ function AdminDashboard({ onLogout }) {
             </button>
           </div>
         </header>
+
         <div className="admin-content">
           <BaseStationView />
         </div>
       </div>
     );
   }
+
+  // =========================
+  // 🏠 HOME DASHBOARD
+  // =========================
 
   return (
     <div className="admin-dashboard">
@@ -86,6 +102,8 @@ function AdminDashboard({ onLogout }) {
 
       <div className="admin-content">
         <div className="dashboard-cards">
+
+          {/* USER MANAGEMENT */}
           <div className="dashboard-card" onClick={() => setView('users')}>
             <div className="card-icon user-icon">
               <FaUsers />
@@ -95,6 +113,7 @@ function AdminDashboard({ onLogout }) {
             <button className="card-btn">Open →</button>
           </div>
 
+          {/* ALERT LOGS */}
           <div className="dashboard-card" onClick={() => setView('logs')}>
             <div className="card-icon logs-icon">
               <FaClipboardList />
@@ -104,6 +123,7 @@ function AdminDashboard({ onLogout }) {
             <button className="card-btn">Open →</button>
           </div>
 
+          {/* BASE STATIONS */}
           <div className="dashboard-card" onClick={() => setView('stations')}>
             <div className="card-icon station-icon">
               <FaMapMarkedAlt />
@@ -113,6 +133,7 @@ function AdminDashboard({ onLogout }) {
             <button className="card-btn">Open →</button>
           </div>
 
+          {/* NETWORK PLANNER */}
           <div className="dashboard-card" onClick={() => setView('planner')}>
             <div className="card-icon" style={{ backgroundColor: '#e3f2fd', color: '#1976d2' }}>
               <FaMapMarkedAlt />
@@ -121,8 +142,20 @@ function AdminDashboard({ onLogout }) {
             <p>Geofence base stations</p>
             <button className="card-btn">Open →</button>
           </div>
+
+          {/* 🔥 NEW: COVERAGE ANALYSIS */}
+          <div className="dashboard-card" onClick={() => setView('coverage')}>
+            <div className="card-icon" style={{ backgroundColor: '#fdecea', color: '#d32f2f' }}>
+              <FaMapMarkedAlt />
+            </div>
+            <h2>COVERAGE ANALYSIS</h2>
+            <p>Detect dead zones</p>
+            <button className="card-btn">Open →</button>
+          </div>
+
         </div>
 
+        {/* STATS */}
         <div className="quick-stats">
           <h3>Quick Stats</h3>
           <div className="stats-grid">
@@ -144,6 +177,7 @@ function AdminDashboard({ onLogout }) {
             </div>
           </div>
         </div>
+
       </div>
     </div>
   );

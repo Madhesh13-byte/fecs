@@ -12,7 +12,6 @@ function UserManagement({ onBack, onStatsUpdate }) {
     email: '',
     password: '',
     role: 'operator',
-    employee_id: '',
     assigned_station: ''
   });
 
@@ -68,7 +67,7 @@ function UserManagement({ onBack, onStatsUpdate }) {
       alert(`Operator created successfully!\nEmployee ID: ${response.data.employee_id}`);
       
       setShowCreateForm(false);
-      setFormData({ username: '', email: '', password: '', role: 'operator', employee_id: '', assigned_station: '' });
+      setFormData({ username: '', email: '', password: '', role: 'operator', assigned_station: '' });
       fetchUsers();
       if (onStatsUpdate) onStatsUpdate();
     } catch (error) {

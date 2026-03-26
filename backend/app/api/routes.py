@@ -71,20 +71,15 @@ async def create_user(
     if existing_user:
         raise HTTPException(status_code=400, detail="Username already exists")
     
-    # Auto-generate employee_id if not provided
-    employee_id = user.employee_id
-    if not employee_id:
-        # Get the highest employee ID number
-        last_user = db.query(User).filter(User.employee_id.isnot(None)).order_by(User.id.desc()).first()
-        if last_user and last_user.employee_id:
-            try:
-                # Extract number from format like "EMP001"
-                last_num = int(last_user.employee_id.replace('EMP', ''))
-                employee_id = f"EMP{str(last_num + 1).zfill(3)}"
-            except:
-                employee_id = "EMP001"
-        else:
-            employee_id = "EMP001"
+    # Auto-generate employee_id
+    all_emp_ids = db.query(User.employee_id).filter(User.employee_id.isnot(None)).all()
+    nums = []
+    for (eid,) in all_emp_ids:
+        try:
+            nums.append(int(eid.replace('EMP', '')))
+        except:
+            pass
+    employee_id = f"EMP{str(max(nums) + 1).zfill(3)}" if nums else "EMP001"
     
     db_user = User(
         username=user.username,
@@ -137,18 +132,14 @@ async def get_next_employee_id(
     db: Session = Depends(get_db),
     admin: User = Depends(get_admin_user)
 ):
-    # Get the highest employee ID number
-    last_user = db.query(User).filter(User.employee_id.isnot(None)).order_by(User.id.desc()).first()
-    if last_user and last_user.employee_id:
+    all_emp_ids = db.query(User.employee_id).filter(User.employee_id.isnot(None)).all()
+    nums = []
+    for (eid,) in all_emp_ids:
         try:
-            # Extract number from format like "EMP001"
-            last_num = int(last_user.employee_id.replace('EMP', ''))
-            next_id = f"EMP{str(last_num + 1).zfill(3)}"
+            nums.append(int(eid.replace('EMP', '')))
         except:
-            next_id = "EMP001"
-    else:
-        next_id = "EMP001"
-    
+            pass
+    next_id = f"EMP{str(max(nums) + 1).zfill(3)}" if nums else "EMP001"
     return {"next_employee_id": next_id}
 
 # Alert endpoints

@@ -35,6 +35,10 @@ def is_duplicate(db: Session, alert: IncomingAlert) -> bool:
     time_threshold = timedelta(seconds=settings.DUPLICATE_TIME_THRESHOLD_SECONDS)
     distance_threshold = settings.DUPLICATE_DISTANCE_THRESHOLD_METERS
     
+    # AUTOMATED alerts are never duplicate — stationarity detection needs them
+    if alert.message_type == MessageType.AUTOMATED:
+        return False
+
     # Query recent alerts from same device with same type
     recent_alerts = db.query(Alert).filter(
         Alert.device_id == alert.device_id,

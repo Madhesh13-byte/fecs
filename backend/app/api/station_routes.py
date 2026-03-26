@@ -8,7 +8,7 @@ from app.api.routes import get_current_user, get_admin_user
 
 router = APIRouter(prefix="/stations", tags=["Base Stations"])
 
-@router.post("/", response_model=BaseStationResponse)
+@router.post("", response_model=BaseStationResponse)
 def create_base_station(
     station_in: BaseStationCreate,
     db: Session = Depends(get_db),
@@ -30,7 +30,7 @@ def create_base_station(
     db.refresh(new_station)
     return new_station
 
-@router.get("/", response_model=List[BaseStationResponse])
+@router.get("", response_model=List[BaseStationResponse])
 def get_base_stations(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user)
