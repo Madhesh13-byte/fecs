@@ -95,3 +95,11 @@ export const createBaseStation = async (stationData, token) => {
   });
   return response.data;
 };
+
+export const getCoverageAnalysis = async (stationId, token, params = {}) => {
+  const response = await axios.get(`${API_URL}/coverage/${stationId}`, {
+    params,
+    headers: { Authorization: `Bearer ${token}` }
+  });
+  return response.data;
+};

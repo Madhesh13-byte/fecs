@@ -7,6 +7,7 @@ import AlertLogs from './AlertLogs';
 import BaseStationView from './BaseStationView';
 import NetworkPlanner from './NetworkPlanner';
 import CoverageAnalysis from './CoverageAnalysis'; // ✅ NEW
+import RelayCoverageAnalysis from './RelayCoverageAnalysis';
 
 import './AdminDashboard.css';
 
@@ -53,6 +54,10 @@ function AdminDashboard({ onLogout }) {
 
   if (view === 'coverage') {
     return <CoverageAnalysis onBack={() => setView('home')} />; // ✅ NEW
+  }
+
+  if (view === 'relay-coverage') {
+    return <RelayCoverageAnalysis onBack={() => setView('home')} />;
   }
 
   if (view === 'stations') {
@@ -150,6 +155,15 @@ function AdminDashboard({ onLogout }) {
             </div>
             <h2>COVERAGE ANALYSIS</h2>
             <p>Detect dead zones</p>
+            <button className="card-btn">Open →</button>
+          </div>
+
+          <div className="dashboard-card" onClick={() => setView('relay-coverage')}>
+            <div className="card-icon" style={{ backgroundColor: '#f3e5f5', color: '#6a1b9a' }}>
+              <FaMapMarkedAlt />
+            </div>
+            <h2>RELAY PLANNER</h2>
+            <p>Suggest relays and recalculate coverage</p>
             <button className="card-btn">Open →</button>
           </div>
 

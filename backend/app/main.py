@@ -2,6 +2,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes import router
 from app.api.station_routes import router as station_router
+from app.api.coverage_routes import coverage_router
 import asyncio
 import logging
 from app.api.routes import router
@@ -33,6 +34,7 @@ app.add_middleware(
 # Include API routes
 app.include_router(router, prefix="/api")
 app.include_router(station_router, prefix="/api")
+app.include_router(coverage_router, prefix="/api")
 
 # WebSocket endpoint
 @app.websocket("/ws")
