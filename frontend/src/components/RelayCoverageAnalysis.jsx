@@ -5,6 +5,7 @@ import {
 } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
+import { saveCoverageCache, getCoverageCache } from "../services/coverageCache";
 
 // ─── helpers ──────────────────────────────────────────────────────────────────
 const R_EARTH = 6378137;
@@ -255,7 +256,7 @@ async function buildCoverageGrid(centerLat, centerLng, radiusMeters, onProgress,
 }
 
 // ─── Relay suggestion from weak/dead cells ────────────────────────────────────
-function suggestRelayPositions(grid, radiusMeters) {
+function suggestRelayPositions(grid, radiusMeters, userRelayRadius) {
   // Only consider weak/dead/forest cells (not water/sea)
   const badCells = grid.filter(
     (c) => c.type === "deadzone" || c.type === "weak" || c.type === "forest"
@@ -263,8 +264,13 @@ function suggestRelayPositions(grid, radiusMeters) {
 
   if (badCells.length === 0) return [];
 
-  // Cluster bad cells using simple grid-based clustering
-  const RELAY_RADIUS = Math.min(radiusMeters * 0.15, 3000); // relay covers ~15% of base radius
+  // Cluster radius = actual relay coverage radius user selected
+  // So each cluster = one relay's coverage zone, no overlap
+  const CLUSTER_RADIUS = userRelayRadius;
+
+  // Minimum spacing between two relay centres = relay radius (no overlap)
+  const MIN_SPACING = userRelayRadius;
+
   const clusters = [];
 
   badCells.forEach((cell) => {
@@ -273,7 +279,7 @@ function suggestRelayPositions(grid, radiusMeters) {
 
     clusters.forEach((cluster) => {
       const d = distMeters(cluster.centroid.lat, cluster.centroid.lng, cell.center.lat, cell.center.lng);
-      if (d < RELAY_RADIUS && d < bestDist) {
+      if (d < CLUSTER_RADIUS && d < bestDist) {
         bestDist = d;
         bestCluster = cluster;
       }
@@ -281,7 +287,6 @@ function suggestRelayPositions(grid, radiusMeters) {
 
     if (bestCluster) {
       bestCluster.cells.push(cell);
-      // Update centroid
       const n = bestCluster.cells.length;
       bestCluster.centroid.lat = bestCluster.cells.reduce((s, c) => s + c.center.lat, 0) / n;
       bestCluster.centroid.lng = bestCluster.cells.reduce((s, c) => s + c.center.lng, 0) / n;
@@ -293,18 +298,29 @@ function suggestRelayPositions(grid, radiusMeters) {
     }
   });
 
-  // Only keep meaningful clusters (>= 3 cells) and limit to top 8
-  return clusters
-    .filter((c) => c.cells.length >= 3)
-    .sort((a, b) => b.cells.length - a.cells.length)
-    .slice(0, 8)
-    .map((c, i) => ({
-      id: i + 1,
-      lat: c.centroid.lat,
-      lng: c.centroid.lng,
-      coverageRadius: RELAY_RADIUS,
-      cellCount: c.cells.length,
-    }));
+  // Sort by most bad cells first, then enforce MIN_SPACING between chosen relays
+  const sorted = clusters
+    .filter((c) => c.cells.length >= 2)
+    .sort((a, b) => b.cells.length - a.cells.length);
+
+  const chosen = [];
+  for (const cluster of sorted) {
+    // Skip if too close to an already chosen relay
+    const tooClose = chosen.some(
+      (r) => distMeters(r.centroid.lat, r.centroid.lng, cluster.centroid.lat, cluster.centroid.lng) < MIN_SPACING
+    );
+    if (tooClose) continue;
+    chosen.push(cluster);
+    if (chosen.length >= 8) break;
+  }
+
+  return chosen.map((c, i) => ({
+    id: i + 1,
+    lat: c.centroid.lat,
+    lng: c.centroid.lng,
+    coverageRadius: userRelayRadius,
+    cellCount: c.cells.length,
+  }));
 }
 
 // ─── Apply relay boost to grid ────────────────────────────────────────────────
@@ -476,21 +492,27 @@ export default function RelayCoverageAnalysis({ onBack }) {
     setBaseGrid(result);
     setBaseSummary(result.summary);
 
-    // Auto-compute relay positions
+    // Auto-compute relay positions using actual user relay radius
     setProgressLabel("Computing relay positions…");
-    const suggestedRelays = suggestRelayPositions(result, region.radius_meters);
-
-    // Override relay radius with user setting
-    const relaysWithRadius = suggestedRelays.map(r => ({ ...r, coverageRadius: relayRadius }));
-    setRelays(relaysWithRadius);
+    const suggestedRelays = suggestRelayPositions(result, region.radius_meters, relayRadius);
+    setRelays(suggestedRelays);
 
     // Compute improved grid
     setProgressLabel("Applying relay coverage boost…");
-    const improved = applyRelayCoverage(result, relaysWithRadius);
+    const improved = applyRelayCoverage(result, suggestedRelays);
     setImprovedGrid(improved);
     setImprovedSummary(
       calcSummary(improved, result.summary.isCoastal, result.summary.elevMin, result.summary.elevMax)
     );
+
+    // Save to cache keyed by stationId + relayRadius
+    saveCoverageCache(`${region.id}_${relayRadius}`, {
+      baseGrid: result,
+      relays: suggestedRelays,
+      improvedGrid: improved,
+      baseSummary: result.summary,
+      improvedSummary: calcSummary(improved, result.summary.isCoastal, result.summary.elevMin, result.summary.elevMax),
+    });
 
     setLoading(false);
     setAnalysed(true);
@@ -499,14 +521,28 @@ export default function RelayCoverageAnalysis({ onBack }) {
 
   const handleRegionChange = (e) => {
     cancelAnalysis();
-    setSelIdx(Number(e.target.value));
-    setBaseGrid([]);
-    setRelays([]);
-    setImprovedGrid([]);
-    setBaseSummary(null);
-    setImprovedSummary(null);
-    setAnalysed(false);
-    setShowImproved(false);
+    const newIdx = Number(e.target.value);
+    setSelIdx(newIdx);
+    const newRegion = regions[newIdx];
+    // Check cache for this station + current relay radius
+    const cached = newRegion ? getCoverageCache(`${newRegion.id}_${relayRadius}`) : null;
+    if (cached) {
+      setBaseGrid(cached.baseGrid || []);
+      setRelays(cached.relays || []);
+      setImprovedGrid(cached.improvedGrid || []);
+      setBaseSummary(cached.baseSummary || null);
+      setImprovedSummary(cached.improvedSummary || null);
+      setAnalysed(true);
+      setShowImproved(false);
+    } else {
+      setBaseGrid([]);
+      setRelays([]);
+      setImprovedGrid([]);
+      setBaseSummary(null);
+      setImprovedSummary(null);
+      setAnalysed(false);
+      setShowImproved(false);
+    }
   };
 
   const displayGrid = showImproved ? improvedGrid : baseGrid;
